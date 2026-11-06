@@ -3826,6 +3826,9 @@ extern "C" __attribute__((naked, used)) void tglGuCDMAWriteBridge() {
 
 void XE::init() {
     callbackXE = this;
+    // -wex-edp-dsc admits a compressed firmware panel source only for the kept
+    // firmware link (-wex-edp-keep); see AlderLakeN::admitDSCPanel.
+    AlderLakeN::admitDSCPanel=checkKernelArgument("-wex-edp-dsc") && checkKernelArgument("-wex-edp-keep");
     // Register notifications before Lilu closes registration. Actual family
     // selection waits for published PCI config space in processKernel.
     lilu.onKextLoadForce(&kextAppleIntelTGLCompat);
