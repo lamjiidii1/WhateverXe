@@ -5,6 +5,11 @@
 #define KERN_XELP_PANEL_POWER_HPP
 #include "kern_vbt.hpp"
 namespace XELP {
+// -wex-edp-dsc (only together with -wex-edp-keep): also admit a PPS0 panel
+// whose VBT backlight control is the VESA eDP AUX interface (BDB 43 type 5,
+// e.g. Samsung OLED), so the firmware eDP port is selected as the panel. The
+// kept firmware link leaves the panel's AUX brightness as the firmware set it.
+static bool panelAUXBacklight=false; // one TU (kern_xe.cpp) in the kext
 struct PanelPower {
  // The current donor has one panel and addresses PPS/PWM controller 0.
  // This qualification does not claim PPS1, AUX backlight or panel admission
@@ -16,7 +21,7 @@ struct PanelPower {
                      (adapter==DisplayAdapter::ADLS && p.ddi==0) ||
                      ((adapter==DisplayAdapter::ADLP || adapter==DisplayAdapter::ADLN) && p.ddi<2);
   if(!backend || !v.valid() || v.unmapped || !p.valid ||
-     !p.backlightValid || !p.pwmPresent || p.backlightType!=2 || p.controller)return false;
+     !p.backlightValid || !p.pwmPresent || (p.backlightType!=2 && !(panelAUXBacklight && p.backlightType==5)) || p.controller)return false;
   const auto &port=v.port[p.ddi];const auto aux=p.ddi?0x10U:0x40U;
   if(!(v.present&(1U<<p.ddi)) || !port.internal() || !port.dp() ||
      (port.type&(0x400|0x20|1)) || (port.flags&0x17) || (port.capabilities&3) ||

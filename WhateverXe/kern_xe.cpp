@@ -3887,6 +3887,7 @@ Display13OutputWiring XE::display13BoardWiring(IOService *provider) {
     auto property=provider->getProperty("xelp-hdmi-wiring");
     if(!property)property=provider->getProperty("tgl-hdmi-wiring");
     if(!xeProfile.displayAdmitted() || xeProfile.display!=XELP::Display::XeLPD)return {};
+    XELP::panelAUXBacklight=checkKernelArgument("-wex-edp-dsc") && checkKernelArgument("-wex-edp-keep");
     // Display13 physical capacity is shared by ADL-N and mobile ADL/RPL.
     // VBT chooses board routing; a family name must not exclude TC PHYs.
     Display13OutputWiring board;
