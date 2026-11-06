@@ -3826,9 +3826,6 @@ extern "C" __attribute__((naked, used)) void tglGuCDMAWriteBridge() {
 
 void XE::init() {
     callbackXE = this;
-    // -wex-edp-dsc admits a compressed firmware panel source only for the kept
-    // firmware link (-wex-edp-keep); see AlderLakeN::admitDSCPanel.
-    AlderLakeN::admitDSCPanel=checkKernelArgument("-wex-edp-dsc") && checkKernelArgument("-wex-edp-keep");
     // Register notifications before Lilu closes registration. Actual family
     // selection waits for published PCI config space in processKernel.
     lilu.onKextLoadForce(&kextAppleIntelTGLCompat);
@@ -3933,6 +3930,11 @@ void XE::adlnBootstrap(IOPCIDevice *pci) {
 	pci->setProperty("N97PhysicalIdentity", pci->configRead32(0), 32);
 	pci->setProperty("N97PhysicalRevision", revision, 32);
 	if (!admitted) return;
+    // -wex-edp-dsc admits a compressed firmware panel source only for the kept
+    // firmware link (-wex-edp-keep); see AlderLakeN::admitDSCPanel. Set before
+    // the first boot readout; every later panel source check reads it.
+    AlderLakeN::admitDSCPanel=checkKernelArgument("-wex-edp-dsc") && checkKernelArgument("-wex-edp-keep");
+    pci->setProperty("WEXEDPDSCAdmitted", AlderLakeN::admitDSCPanel);
     xelpMemory=xelpPhysicalMemory(pci);xelpMemoryGGC=pci->configRead16(0x50);
     uint64_t memory[] {1,xelpMemory.valid,xelpMemory.base,xelpMemory.bytes,xelpMemory.gttBytes,xelpMemory.apertureBytes};
     pci->setProperty("N97PhysicalMemoryLayout",memory,sizeof(memory));
