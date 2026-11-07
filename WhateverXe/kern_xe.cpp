@@ -3935,8 +3935,11 @@ Display13OutputWiring XE::display13BoardWiring(IOService *provider) {
     Display13OutputWiring board;
     if(!property) {
         board=XELP::VBT::display13Fixed(firmwarePorts,Display13OutputWiring::Physical,xeProfile.family);
-        if(display13PanelDP && board.valid)
+        if(display13PanelDP && board.valid) {
             board.dp|=XELP::VBT::display13PanelDP(firmwarePorts)&~board.hdmi;
+            board.dp&=~0x78U;
+            board.typeC=0;
+        }
     }
     else {
         // Preserve the older ADL-N Combo property contract. It cannot select TC.

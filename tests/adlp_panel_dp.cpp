@@ -93,7 +93,8 @@ int main() {
         auto fixed=display13Fixed(real,Display13OutputWiring::Physical);
         assert(fixed.valid && !fixed.hdmi && fixed.dp==fixed.typeC); // TC children are Type-C capable, not fixed
         fixed.dp|=display13PanelDP(real);
-        assert(Display13FBTopology::supportedWiring(fixed,true,1) && (fixed.selected()&1)==1);
+        fixed.dp&=~0x78U;fixed.typeC=0;
+        assert(Display13FBTopology::supportedWiring(fixed,true,1) && fixed.selected()==1);
         assert(parse(raw.data(),raw.size(),Family::AlderLakeP).status==Status::Conflict);
     } else assert(!"missing VBT fixture");
     puts("adlp_panel_dp ok");
