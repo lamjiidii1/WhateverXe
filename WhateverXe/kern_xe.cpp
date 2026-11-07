@@ -158,6 +158,11 @@ extern "C" __attribute__((naked,used)) void tglTahoeMatrixBridge() {
   "2: jmpq *_tglSonomaMatrixOther(%rip)\n");
 }
 static bool tglSonomaSurfaceFramebufferReady=true;
+// -wex-edp-dsc diagnostics: the Tahoe TGL framebuffer donor is built with LLVM
+// profile instrumentation (__llvm_prf_cnts, one 64-bit counter per basic block).
+// Its load address lets display13DSCAfterMode publish the live counters.
+static mach_vm_address_t tglFramebufferAddress=0;
+static size_t tglFramebufferSize=0;
 static bool tglInstallSonomaSurfaceABI(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,bool framebuffer) {
  if((XELP::kernelOS(version)!=XELP::OS::Sonoma) && (XELP::kernelOS(version)!=XELP::OS::Sequoia) && (XELP::kernelOS(version)!=XELP::OS::Tahoe))return true;
  struct Site {size_t offset,length;uint8_t before[6],after[6];};
@@ -176,6 +181,7 @@ static bool tglInstallSonomaSurfaceABI(KernelPatcher &patcher,size_t index,mach_
  };
  const size_t methods[] {framebuffer?0x2B4BAU:0x72834U,framebuffer?0x39FBAU:0x80EF0U};
  const auto sites=framebuffer?fb:accel;
+ if(framebuffer) {tglFramebufferAddress=address;tglFramebufferSize=size;}
  bool ready=size>(framebuffer?0x3A02CU:0x81367U);
  for(unsigned i=0;i<2;++i) {
   ready=ready && patcher.solveSymbol<mach_vm_address_t>(index,symbols[i],address,size)==address+methods[i];
@@ -7060,6 +7066,24 @@ uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,c
 // -wex-edp-dsc diagnostics: the display registers right after each donor
 // mode set (plane, stride, surface, scaler, DSC, transcoder), the first and the
 // last one, to compare with the firmware's N97Display13Boot.
+// PerformFlipTransaction+0x11 is `incq disp32(%rip)` on the function's first
+// counter (file address 0xD9248, section start 0xD0910, 0x1C200 bytes). Use the
+// runtime displacement, so it stays correct after the KC layout moved __DATA.
+static void display13PublishProfileCounters(IORegistryEntry *root) {
+    constexpr size_t Insn=0x2B613,First=0xD9248,Start=0xD0910,Bytes=0x1C200;
+    uint32_t info[4]={0,0,0,0};
+    if(tglFramebufferAddress && tglFramebufferSize>Insn+7) {
+        auto code=reinterpret_cast<const uint8_t *>(tglFramebufferAddress+Insn);
+        if(code[0]==0x48 && code[1]==0xFF && code[2]==0x05) {
+            int32_t disp;memcpy(&disp,code+3,sizeof(disp));
+            const auto first=tglFramebufferAddress+Insn+7+static_cast<int64_t>(disp);
+            const auto base=first-(First-Start);
+            info[0]=1;info[1]=static_cast<uint32_t>(base-tglFramebufferAddress);info[2]=Bytes;
+            if(auto d=OSData::withBytesNoCopy(reinterpret_cast<void *>(base),Bytes)) {root->setProperty("WEXPrfCnts",d);d->release();info[3]=1;}
+        } else info[0]=2;
+    }
+    root->setProperty("WEXPrfInfo",info,sizeof(info));
+}
 static void display13DSCAfterMode() {
     auto &c=display13FBPower;
     if(!AlderLakeN::admitDSCPanel || !c.lock || !c.map)return;
@@ -7070,6 +7094,7 @@ static void display13DSCAfterMode() {
     if(call==1) {
         root->setProperty("WEXEDPDSCAfterModeFirst",&live,sizeof(live));
         if(auto d=OSData::withBytesNoCopy(display13VBLTrace,sizeof(display13VBLTrace))) {root->setProperty("WEXVBLTrace",d);d->release();}
+        display13PublishProfileCounters(root);
     }
     root->setProperty("WEXEDPDSCAfterMode",&live,sizeof(live));
     root->setProperty("WEXEDPDSCAfterModeCall",call,32);
