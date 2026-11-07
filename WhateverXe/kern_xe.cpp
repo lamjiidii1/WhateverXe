@@ -7795,10 +7795,35 @@ uint32_t XE::wrapDisplay13TrainingPattern(void *path,uint32_t pattern) {
 // path attached (+3644 stays 2) and returns success. Anything else keeps the
 // donor's answer. The owner lock is held only for the register readout; the
 // DPCD status read runs after it.
+// -wex-edp-dsc-retrain (with -wex-edp-keep -wex-edp-dsc): do not keep the
+// firmware's compressed link. Linux drives the Galaxy Book3 Ultra panel
+// uncompressed at 2880x1800@120, 8 bpc, four HBR2 lanes, so let the donor run
+// its complete mode set on the capped HBR2 caps, after clearing the pipe A
+// VDSC and DSC joiner enables it never programs.
+static bool display13DSCRetrainLink(void *path) {
+ static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-dsc-retrain") ? 1 : 0;
+ auto &c=display13FBPower;
+ if(v!=1 || !AlderLakeN::admitDSCPanel || !c.lock || !c.map || !path)return false;
+ if(static_cast<OSObject *>(path)->getMetaClass()->getClassSize()<0x3730 || Display13FBMemory::field<uint32_t>(path,0x3640)!=0)return false;
+ IOLockLock(c.lock);
+ const auto base=c.map->getVirtualAddress();const bool ok=base && c.map->getLength()==0x1000000;
+ uint32_t before[2] {},after[2] {};
+ if(ok) {
+  auto reg=[&](uint32_t o)->volatile uint32_t &{return *reinterpret_cast<volatile uint32_t *>(base+o);};
+  before[0]=reg(0x78000);before[1]=reg(0x78004);
+  reg(0x78004)=before[1]&~0x80008000U;reg(0x78000)=before[0]&~0x40000000U;
+  after[0]=reg(0x78000);after[1]=reg(0x78004);
+ }
+ IOLockUnlock(c.lock);
+ static volatile uint32_t calls=0;const uint32_t record[5]={__sync_add_and_fetch(&calls,1),before[0],before[1],after[0],after[1]};
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPDSCRetrain",const_cast<uint32_t *>(record),sizeof(record));
+ return ok;
+}
 bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler) {
  auto s=callbackXE;auto &c=display13FBPower;
  const bool update=FunctionCast(wrapDisplay13RegsNeedUpdate,s->orgDisplay13RegsNeedUpdate)(controller,fb,path,params,timing,scaler);
  if(!update || !display13EDPKeep() || !c.lock || !path || !params)return update;
+ if(display13DSCRetrainLink(path))return update;
  namespace K=Display13EDPKeep;
  Display13EDPKeepRecord record {};record.version=1;record.call=__sync_add_and_fetch(&display13EDPKeepCalls,1);
  record.ddi=record.pipe=record.state=UINT32_MAX;

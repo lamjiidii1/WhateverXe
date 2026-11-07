@@ -14,7 +14,7 @@ functions='\n'.join(re.search(re.escape(sig)+r'.*?\n\}',s,re.S).group() for sig 
  'bool XE::wrapDisplay13RegsNeedUpdate('])
 binding=re.search(r'static TGLFBBinding::Readout adlnInspectPathBinding\(.*?\n\}',s,re.S).group()
 keep=s[s.index('// -wex-edp-keep: keep the firmware-trained panel link (kern_display13_edp_keep,'):s.index('uint32_t XE::wrapDisplay13ReadAUX(')]
-keep=(r/'tests/display13_edp_keep_stubs.hpp').read_text()+'\n'+keep
+keep=(r/'tests/display13_edp_keep_stubs.hpp').read_text()+'\n'+keep+'\nstatic bool display13DSCRetrainLink(void *){return false;}\n'
 objects=(r/'tests/tgl_fb_binding.cpp').read_text().split('int main()')[0].replace('port[0x580]','port[0x700]')
 base=(r/'tests/display13_sst_fixture.cpp').read_text().split('int main(')[0]
 # The real context's boot readout and panel flag, read through the same
