@@ -1,0 +1,24 @@
+name: hidprobe
+
+on:
+  push:
+    paths:
+      - tools/hidprobe/**
+      - .github/workflows/hidprobe.yml
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: |
+        cd tools/hidprobe
+        clang -O2 -arch x86_64 -arch arm64 -mmacosx-version-min=11.0 -framework IOKit -framework CoreFoundation -o hidprobe hidprobe.c
+        codesign -s - -f hidprobe
+        file hidprobe
+    - uses: actions/upload-artifact@v4
+      with:
+        name: hidprobe
+        path: tools/hidprobe/hidprobe
