@@ -6,9 +6,14 @@ on:
       - .github/workflows/voodooi2c.yml
   workflow_dispatch:
 
+env:
+  PROJECT_TYPE: KEXT
+
 jobs:
   build:
     runs-on: macos-latest
+    env:
+      JOB_TYPE: BUILD
     steps:
     - name: Checkout VoodooI2C
       uses: actions/checkout@v4
