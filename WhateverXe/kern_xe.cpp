@@ -7781,9 +7781,17 @@ bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *
  auto p=port ? display13SSTPort(port) : nullptr;
  if(!p && port)p=display13PanelBootPort(port);
  if(p)record.ddi=Display13FBMemory::field<uint32_t>(p,0x120);
- if(!p || controller!=c.controller || record.ddi>=2 || !(s->adlnOutputWiring.panel&(1U<<record.ddi)) || record.pipe!=0)reasons|=K::NotPanel;
+ // -wex-edp-dsc: a later mode set of the same boot path (macOS switching from
+ // the native mode to its default HiDPI mode, same timing) can arrive with the
+ // path's port no longer resolvable (path state 1, Galaxy Book3 Ultra). The
+ // firmware's compressed link still runs and cannot be retrained here, so
+ // decide on the adopted boot path and the live pipe exactly as for the first.
+ const bool dscBootPath=!p && AlderLakeN::admitDSCPanel && controller==c.controller && record.pipe==0 &&
+  c.bootPanel && c.bridge.bootAdopted && c.bridge.bootPath==reinterpret_cast<uintptr_t>(path) && c.bridge.bootPort<2;
+ if(dscBootPath)record.ddi=c.bridge.bootPort;
+ if((!p && !dscBootPath) || controller!=c.controller || record.ddi>=2 || !(s->adlnOutputWiring.panel&(1U<<record.ddi)) || record.pipe!=0)reasons|=K::NotPanel;
  else {
-  record.portLanes=Display13FBMemory::field<uint32_t>(p,0x124);record.portRate=Display13FBMemory::field<uint32_t>(p,0x128);
+  if(p){record.portLanes=Display13FBMemory::field<uint32_t>(p,0x124);record.portRate=Display13FBMemory::field<uint32_t>(p,0x128);}
   if(!c.bootPanel || c.bridge.bootPort!=record.ddi || !c.bridge.bootAdopted ||
      c.bridge.bootPath!=reinterpret_cast<uintptr_t>(path))reasons|=K::NotBoot;
   Display13FBBootIO io{c.map};auto &live=c.displayScratch;AlderLakeN::readDisplay(io,true,live);
@@ -7803,7 +7811,7 @@ bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *
   record.wanted[7]=w.source;
  }
  IOLockUnlock(c.lock);
- if(!(reasons&K::NotPanel)) {
+ if(!(reasons&K::NotPanel) && port) {
   uint8_t status[6] {};
   const auto r=wrapDisplay13ReadAUX(port,0x202,status,sizeof(status));
   if(r || !K::sinkTrained(status,lanes))reasons|=K::Sink;
