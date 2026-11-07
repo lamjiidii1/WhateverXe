@@ -319,6 +319,12 @@ int main() {
     assert(clockFits(cursorClockPlan,400000000) && !clockFits(cursorClockPlan,399999999));
     clockPlan.pipePixelHz=200000000;clockPlan.pipeLineTime=pipeLineTime(p.htotal,clockPlan.pipePixelHz);
     assert(!clockFits(clockPlan,384000000));
+    // Two pixels per CDCLK (opt-in): the same plan fits at half the clock.
+    auto twoPixelPlan=committed.snapshot(p);
+    assert(!clockFits(twoPixelPlan,148500000*2-1));
+    twoPixelsPerClock()=true;
+    assert(clockFits(twoPixelPlan,148500000) && !clockFits(twoPixelPlan,148499999));
+    twoPixelsPerClock()=false;
     LatchIO afterCrawl(p);afterCrawl.clock=1305600000;
     assert(latch(afterCrawl,afterCrawl.snapshot(p)).status==Status::Complete && afterCrawl.writes.empty());
     LatchIO sameFrame(p);sameFrame.frozen=true;

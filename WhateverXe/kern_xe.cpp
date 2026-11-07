@@ -3941,6 +3941,7 @@ void XE::adlnBootstrap(IOPCIDevice *pci) {
     // firmware link (-wex-edp-keep); see AlderLakeN::admitDSCPanel. Set before
     // the first boot readout; every later panel source check reads it.
     AlderLakeN::admitDSCPanel=checkKernelArgument("-wex-edp-dsc") && checkKernelArgument("-wex-edp-keep");
+    Display13WM::twoPixelsPerClock()=AlderLakeN::admitDSCPanel;
     pci->setProperty("WEXEDPDSCAdmitted", AlderLakeN::admitDSCPanel);
     xelpMemory=xelpPhysicalMemory(pci);xelpMemoryGGC=pci->configRead16(0x50);
     uint64_t memory[] {1,xelpMemory.valid,xelpMemory.base,xelpMemory.bytes,xelpMemory.gttBytes,xelpMemory.apertureBytes};

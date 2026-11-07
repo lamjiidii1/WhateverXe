@@ -293,6 +293,9 @@ int main() {
     assert(!apertureRange(qualified.pool,0,0x3000001,0x10000000));
     assert(!apertureRange(qualified.pool,0x3000000,4096,0x10000000));
     assert(!apertureRange(qualified.pool,0,0x800000,0x400000));
+    // 2880x1800x4 scanout: exact, non-page-multiple size inside the pool.
+    assert(apertureRange(qualified.pool,0,0x13C6800,0x10000000));
+    assert(!apertureRange(qualified.pool,0,0x13C6800,0x13C6800));
     Fixture accelerator;put(accelerator.controller,0xC0,uintptr_t(1));
     assert(accelerator.inspect().status==Status::Association && !accelerator.reads);
     // Explicit native owner admits only the original stolen pool. A different

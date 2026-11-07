@@ -286,12 +286,18 @@ inline TriggerSurfaces triggerSurfaces(const TriggerPacket *packets,uint32_t cou
 // These linear RGB/cursor WM and PIPE_WM_LINETIME equations do not consume
 // CDCLK. An unchanged hardware-verified plan is valid at another clock when
 // every consumer still fits its bandwidth. A clock request alone is no proof.
+// Display 12+ pipes process two pixels per CDCLK cycle (Linux
+// intel_pixel_rate_to_cdclk: DIV_ROUND_UP(pixel_rate, 2) for display >= 10).
+// The default keeps the one-pixel-per-clock bound; -wex-edp-dsc opts in to the
+// hardware limit, needed by 2880x1800@120 (655.13 MHz) at CDCLK 556.8/652.8 MHz.
+inline bool &twoPixelsPerClock() {static bool enabled=false;return enabled;}
 inline bool clockFits(const Snapshot &s,uint64_t nativeHz) {
+    const auto limit=twoPixelsPerClock() ? nativeHz : nativeHz/2; // nativeHz is twice CDCLK
     return s.primary && s.primary->status==Status::Complete && nativeHz &&
-        s.primary->pixelHz && s.primary->pixelHz<=nativeHz/2 && s.pipePixelHz &&
-        s.pipePixelHz<=nativeHz/2 && s.pipeLineTime==pipeLineTime(s.primary->htotal,s.pipePixelHz) &&
+        s.primary->pixelHz && s.primary->pixelHz<=limit && s.pipePixelHz &&
+        s.pipePixelHz<=limit && s.pipeLineTime==pipeLineTime(s.primary->htotal,s.pipePixelHz) &&
         (!s.cursorActive || (s.cursor && s.cursor->status==Status::Complete &&
-            s.cursor->pixelHz && s.cursor->pixelHz<=nativeHz/2));
+            s.cursor->pixelHz && s.cursor->pixelHz<=limit));
 }
 enum class LatchCheck : uint32_t {None,Controls,OtherPlane,DSB,Clock,Registers,Live,Frame,AwaitingScanout,AwaitingFlip};
 struct Latch {
