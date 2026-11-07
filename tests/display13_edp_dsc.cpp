@@ -5,9 +5,11 @@
 #include "kern_alderlake_n.hpp"
 #include "kern_display13_firmware.hpp"
 #include "kern_display13_fb_topology.hpp"
+#include "kern_display13_edp_keep.hpp"
 #include <map>
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 using namespace AlderLakeN;
 struct IO {
     std::map<uint32_t,uint32_t> regs;
@@ -581,5 +583,24 @@ int main() {
     assert(board.panel==1 && board.described());
     assert(Display13FBTopology::bootDDI(board,io.regs[0x60400],true)==0);
     XELP::panelAUXBacklight=false;
+    // Link caps: HBR2 under -wex-edp-dsc (HBR otherwise); eDP 1.4 rate table
+    // entries above the cap are removed, lower ones kept.
+    {uint8_t caps[3]={0x14,0x1E,0x84};Display13EDPKeep::capLinkCaps(0,caps,3);assert(caps[1]==0x0A);
+     uint8_t big[3]={0x14,0x1E,0x84};Display13EDPKeep::capLinkCaps(0,big,3,true);assert(big[1]==0x14 && big[2]==0x84);
+     uint8_t bw[1]={0x1E};Display13EDPKeep::capLinkCaps(0x100,bw,1,true);assert(bw[0]==0x14);
+     // 200 kHz units: 2.7G 13500 (0x34BC), 5.4G 27000 (0x6978), 8.1G 40500 (0x9E34)
+     uint8_t rates[6]={0xBC,0x34,0x78,0x69,0x34,0x9E};Display13EDPKeep::capLinkCaps(0x10,rates,6,true);
+     assert(rates[0]==0xBC && rates[2]==0x78 && !rates[4] && !rates[5]);}
+    // Lane plan: the firmware's four DSC lanes against a donor plan of two.
+    {Display13EDPKeep::Live l{};l.func=io.regs[0x60400];l.transconf=0xC0000000U;
+     const uint32_t t[6]={io.regs[0x60000],io.regs[0x60004],io.regs[0x60008],io.regs[0x6000C],io.regs[0x60010],io.regs[0x60014]};
+     for(unsigned i=0;i<6;++i)l.timing[i]=t[i];l.source=io.regs[0x6001C];
+     uint8_t p[0x30]={};uint32_t func=(l.func&~0xEU)|(1U<<1);memcpy(p+4,&func,4);
+     for(unsigned i=0;i<6;++i)memcpy(p+0x10+4*i,&t[i],4);memcpy(p+0x28,&l.source,4);
+     const auto w=Display13EDPKeep::wanted(p);
+     assert(Display13EDPKeep::compare(l,w,2)&Display13EDPKeep::Format);
+     assert(!(Display13EDPKeep::compare(l,w,2,true)&Display13EDPKeep::Blocking));
+     uint32_t bpc10=func|(1U<<20);memcpy(p+4,&bpc10,4);
+     assert(Display13EDPKeep::compare(l,Display13EDPKeep::wanted(p),2,true)&Display13EDPKeep::Format);}
     printf("PASS eDP DSC admission on the Galaxy Book3 Ultra readout\n");
 }

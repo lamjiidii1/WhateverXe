@@ -7318,7 +7318,7 @@ uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_
  IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);
  const auto ddi=complete ? Display13FBMemory::field<uint32_t>(port,0x120) : UINT32_MAX;
  const bool panel=ddi<2 && (callbackXE->adlnOutputWiring.panel&(1U<<ddi));IOLockUnlock(c.lock);
- if(!r && complete && panel && display13EDPKeep())Display13EDPKeep::capLinkCaps(address,static_cast<uint8_t *>(data),length);
+ if(!r && complete && panel && display13EDPKeep())Display13EDPKeep::capLinkCaps(address,static_cast<uint8_t *>(data),length,AlderLakeN::admitDSCPanel);
  return r ? r : complete ? 0 : kIOReturnNotReady;
 }
 uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32_t length) {
@@ -7796,7 +7796,7 @@ bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *
    K::Live l {};l.func=values[0];l.transconf=values[1];
    for(unsigned i=0;i<6;++i)l.timing[i]=values[2+i];
    l.source=values[8];lanes=((l.func>>1)&7)+1;
-   reasons|=K::compare(l,K::wanted(params),record.portLanes);
+   reasons|=K::compare(l,K::wanted(params),record.portLanes,AlderLakeN::admitDSCPanel);
   }
   const auto w=K::wanted(params);record.wanted[0]=w.func;
   for(unsigned i=0;i<6;++i)record.wanted[1+i]=w.timing[i];

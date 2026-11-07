@@ -49,7 +49,10 @@ inline Wanted wanted(const void *params) {
 // or the transcoder's M/N, so the pipe keeps the firmware's rate whatever the
 // donor computed (the IdeaPad's firmware leaves LINK_BW_SET 0x14 next to
 // LINK_RATE_SET 3; the donor picks HBR).
-inline uint32_t compare(const Live &live,const Wanted &want,uint32_t portLanes) {
+// anyLanes (-wex-edp-dsc): a compressed firmware link carries the panel at a
+// lane count the donor's uncompressed link plan need not match; the kept
+// same-mode branch never rewrites the link, so only the depth is compared.
+inline uint32_t compare(const Live &live,const Wanted &want,uint32_t portLanes,bool anyLanes=false) {
  uint32_t reasons=0;
  if((live.transconf&0xC0000000U)!=0xC0000000U)reasons|=PipeOff;
  // HTOTAL/VTOTAL bits 13:0 (12:0) hold the active size minus one.
@@ -57,7 +60,7 @@ inline uint32_t compare(const Live &live,const Wanted &want,uint32_t portLanes) 
     live.source!=want.source)reasons|=Timing;
  for(unsigned i=0;i<6;++i)if(live.timing[i]!=want.timing[i])reasons|=Blanking;
  const auto lanes=((live.func>>1)&7)+1;
- if(lanes!=portLanes || ((want.func>>1)&7)+1!=lanes || ((live.func^want.func)&0x00700000U))reasons|=Format;
+ if((!anyLanes && (lanes!=portLanes || ((want.func>>1)&7)+1!=lanes)) || ((live.func^want.func)&0x00700000U))reasons|=Format;
  return reasons;
 }
 // DPCD 0x202..0x204: every active lane CR, EQ and symbol lock, aligned.
@@ -73,14 +76,19 @@ inline bool sinkTrained(const uint8_t *status,uint32_t lanes) {
 // MAX_LINK_RATE) and the LINK_BW_SET the donor reads back and reuses (0x100).
 // At HBR setupOptimalLaneCount gives a 1920x1200@60 8 bpc mode the firmware's
 // two lanes (one at HBR2). Nothing is written to the sink.
-inline void capLinkCaps(uint32_t address,uint8_t *data,uint32_t length) {
+// hbr2 (-wex-edp-dsc): cap at HBR2 instead, so a 2880x1800@120 8 bpc panel
+// mode (about 15.7 Gbps) still has a donor link plan (four HBR2 lanes);
+// capped at HBR the donor's link-modeset callback finds none and its mode set
+// continues with an unset timing.
+inline void capLinkCaps(uint32_t address,uint8_t *data,uint32_t length,bool hbr2=false) {
  if(!data || !length)return;
+ const uint8_t rateCap=hbr2?0x14:0x0A;const uint32_t tableCap=hbr2?27000U:13500U;
  const auto at=[&](uint32_t reg)->uint8_t *{return reg>=address && reg-address<length ? data+(reg-address) : nullptr;};
  const uint32_t rates[]={0x001U,0x2201U,0x100U};
- for(const auto reg:rates)if(auto b=at(reg); b && *b>0x0AU)*b=0x0A;
+ for(const auto reg:rates)if(auto b=at(reg); b && *b>rateCap)*b=rateCap;
  for(uint32_t i=0;i<8;++i) {
   auto lo=at(0x10+2*i),hi=at(0x11+2*i);
-  if(lo && hi && uint32_t(*lo|(*hi<<8))>13500U)*lo=*hi=0;
+  if(lo && hi && uint32_t(*lo|(*hi<<8))>tableCap)*lo=*hi=0;
  }
 }
 // The panel EDID's DisplayPort color depth (EDID 1.4 video input definition,
