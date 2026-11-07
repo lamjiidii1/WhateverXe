@@ -55,6 +55,17 @@ int main(int argc, char **argv) {
             uint8_t *buf = calloc(1, 2048);
             IOHIDDeviceRegisterInputReportCallback(devs[i], buf, 2048, onReport, NULL);
             uint8_t fr[8]; CFIndex fl;
+            const char *mode = argc > 2 ? argv[2] : "";
+            if (!strcmp(mode, "ptp") || !strcmp(mode, "mouse")) {
+                uint8_t im[2] = {4, !strcmp(mode, "ptp") ? 3 : 0};
+                r = IOHIDDeviceSetReport(devs[i], kIOHIDReportTypeFeature, 4, im, 2);
+                printf("  set input mode %u: ret=0x%x\n", im[1], r);
+                if (!strcmp(mode, "ptp")) {
+                    uint8_t sw[2] = {6, 3};
+                    r = IOHIDDeviceSetReport(devs[i], kIOHIDReportTypeFeature, 6, sw, 2);
+                    printf("  set surface+button switch: ret=0x%x\n", r);
+                }
+            }
             for (int id = 4; id <= 8; id += 2) {
                 fl = sizeof fr; memset(fr, 0, sizeof fr);
                 r = IOHIDDeviceGetReport(devs[i], kIOHIDReportTypeFeature, id, fr, &fl);
