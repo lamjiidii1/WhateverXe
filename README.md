@@ -5,6 +5,21 @@
 WhateverXe is a Lilu plugin, derived from WhateverGreen, that adapts Apple graphics drivers for selected Intel Xe-LP integrated GPUs.
 Use the latest releases of [WhateverXe](https://github.com/b00t0x/WhateverXe/releases) and [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases) together. See [CHANGELOG](CHANGELOG.md) for release notes.
 
+> [!NOTE]
+> ### Alder Lake-U/P Internal OLED / eDP Branch (`adlp-0.8.0`)
+> This fork ports and rebases the `adlp-edp` patchset onto **WhateverXe 0.8.0**, bringing native hardware acceleration and internal display output to **Intel 12th Gen Alder Lake-U/P (Iris Xe `8086:46AA`)** laptops with internal eDP / OLED panels (such as the **HP Envy x360 2-in-1 13-bf0xxx**).
+>
+> **Key features of this branch:**
+> 1. **Native Dynamic MMIO Resolution (`TGLMMIOStrongUCRouted = Yes`)**: Resolves kernel MMIO hooks dynamically in memory on macOS Sequoia 15.8.x without requiring hardcoded byte pattern matching or binary patching across macOS point updates.
+> 2. **VBT First-Child-Wins Parser**: Handles duplicate DDI 1 digital child declarations in Alder Lake VBTs that cause upstream to abort with `Status::Conflict`.
+> 3. **Fixed Combo A DP Output (`-wex-adlp-edp`)**: Admits internal eDP panels even when the firmware VBT sets `panel_type = 0xFF` (PnP ID select).
+> 4. **Display 13 Speculative Type-C Route Mask**: Fixes boot black screen (`FB0: Resources allocation failed (0xe00002bc)`) by clearing speculative DP-alt Type-C routes during internal panel link training.
+> 5. **Backward Compatibility**: Fully compatible with WhateverXe Graphics 0.3.1 (`AppleIntelTGLCompat` 0.6.0 ABI).
+>
+> **Verified on real hardware:** HP Envy x360 13-bf0xxx (i7-1250U, Iris Xe GT2 `8086:46AA`, 2880×1800 OLED, macOS Sequoia 15.8.2 `24H232`).
+> Working OpenCore EFI reference: [HP-Envy-X360-13bf0xxx-EFI](https://github.com/lamjiidii1/HP-Envy-X360-13bf0xxx-EFI/tree/wex080-adlp).
+> See [docs/adlp-edp-port.md](docs/adlp-edp-port.md) for full technical documentation and diagnosis.
+
 ## Compatibility
 
 | macOS | Required version |
@@ -24,6 +39,7 @@ Sequoia and Tahoe accept compatible updates within their OS family. Future Apple
 - Alder Lake-N: 16- and 24-EU configurations.
 - Twin Lake: 32-EU configurations.
 - Alder Lake-H: 96-EU configurations, including single-channel operation.
+- Alder Lake-UP4: HP Envy x360 13-bf0xxx (i7-1250U, Iris Xe `8086:46AA`), 2880×1800 OLED internal eDP, Metal 2, hardware HEVC/HEIC decode on macOS Sequoia 15.8.2 (`adlp-0.8.0` branch).
 - Alder Lake-S: UHD Graphics 770.
 - Raptor Lake-U: 48-EU configurations.
 
