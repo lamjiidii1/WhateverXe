@@ -100,6 +100,26 @@ inline void capLinkCaps(uint32_t address,uint8_t *data,uint32_t length,bool hbr2
 // bits 6:4) reported as 8 bits per component when it says more, with the
 // checksum fixed, so AGDC policy, mode validation and the mode set agree on the
 // firmware's depth. Anything but a digital EDID 1.4 base block is unchanged.
+// -wex-edp-60 (diagnostic): halve the pixel clock of every detailed timing
+// above 400 MHz in an EDID base block or CEA extension, so a 2880x1800@120
+// panel (655.13 MHz) is offered as 2880x1800@60 with the same raster. Checksum
+// fixed; other blocks are unchanged.
+inline bool edidHalfClock(uint8_t *b) {
+ static const uint8_t header[]={0,255,255,255,255,255,255,0};
+ unsigned first=0,last=0;
+ if(!b)return false;
+ if(!__builtin_memcmp(b,header,sizeof(header))) {first=54;last=108;}
+ else if(b[0]==0x02 && b[2]>=4 && b[2]<=127-18) {first=b[2];last=127-18;}
+ else return false;
+ bool changed=false;
+ for(unsigned o=first;o<=last;o+=18) {
+  const uint32_t clock=b[o]|(b[o+1]<<8);
+  if(!clock)break;
+  if(clock>40000) {const uint32_t half=(clock+1)/2;b[o]=uint8_t(half);b[o+1]=uint8_t(half>>8);changed=true;}
+ }
+ if(changed) {uint32_t sum=0;for(unsigned i=0;i<127;++i)sum+=b[i];b[127]=uint8_t(-sum);}
+ return changed;
+}
 inline bool edid8bpc(uint8_t *edid) {
  static const uint8_t header[]={0,255,255,255,255,255,255,0};
  if(!edid || __builtin_memcmp(edid,header,sizeof(header)) || edid[18]!=1 || edid[19]<4 ||

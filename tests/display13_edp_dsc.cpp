@@ -606,5 +606,12 @@ int main() {
      assert(!(Display13EDPKeep::compare(l,w,2,true)&Display13EDPKeep::Blocking));
      uint32_t bpc10=func|(1U<<20);memcpy(p+4,&bpc10,4);
      assert(Display13EDPKeep::compare(l,Display13EDPKeep::wanted(p),2,true)&Display13EDPKeep::Format);}
+    // -wex-edp-60: the machine's EDID base block (one 655.13 MHz DTD) at half clock.
+    {static const char *hex="00ffffffffffff004c8385410000000000200104a5221678030cf1ae523cb9230c4e5200000001010101010101010101010101010101e9ff4064b00820702008880058d71000001b000000fd003078dbdb420100000000000000000000000000000000000000000000000000000000fe0041544e413630434c30332d302001af";
+     uint8_t e[128];for(unsigned i=0;i<128;++i){unsigned v;sscanf(hex+2*i,"%2x",&v);e[i]=uint8_t(v);}
+     assert(Display13EDPKeep::edidHalfClock(e));assert((e[54]|(e[55]<<8))==32757);
+     unsigned sum=0;for(unsigned i=0;i<128;++i)sum+=e[i];assert(!(sum&255));
+     assert(!Display13EDPKeep::edidHalfClock(e));
+     uint8_t other[128]={0x70};assert(!Display13EDPKeep::edidHalfClock(other));}
     printf("PASS eDP DSC admission on the Galaxy Book3 Ultra readout\n");
 }

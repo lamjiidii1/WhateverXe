@@ -8442,6 +8442,11 @@ uint32_t XE::wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,b
     // -wex-edp-keep: the panel EDID's depth as the firmware runs it (8 bpc).
     if(!result && block==1 && selected && config && config[0]<2 &&
        (callbackXE->adlnOutputWiring.panel&(1U<<config[0])) && display13EDPKeep())Display13EDPKeep::edid8bpc(data);
+    // -wex-edp-60 (diagnostic, with -wex-edp-keep): the panel's detailed
+    // timings at half the pixel clock (2880x1800@120 -> @60, same raster).
+    static int half=-1;if(half<0)half=checkKernelArgument("-wex-edp-60") ? 1 : 0;
+    if(half==1 && !result && (block==1 || block==2) && selected && config && config[0]<2 &&
+       (callbackXE->adlnOutputWiring.panel&(1U<<config[0])) && display13EDPKeep())Display13EDPKeep::edidHalfClock(data);
     cachePanelDepth(port,block,data,result);
     if(selected) {
         if(!result && data && (block==1 || block==2)) {
