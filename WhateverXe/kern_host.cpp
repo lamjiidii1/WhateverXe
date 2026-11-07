@@ -11,6 +11,10 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_iokit.hpp>
 #include <IOKit/pci/IOPCIDevice.h>
+#include <IOKit/acpi/IOACPIPlatformDevice.h>
+
+static void dumpPanelACPITables();
+void xePmInstall(KernelPatcher &patcher);
 static size_t hostInstructionSize(const uint8_t *bytes,size_t length) {
  uint8_t code[32] {};memcpy(code,bytes,length<sizeof(code)?length:sizeof(code));
  Disassembler::hde_t ins {};
@@ -48,6 +52,8 @@ void XeHost::init() {
  XeDataAccess::init();
 }
 void XeHost::processKernel(KernelPatcher &patcher) {
+ // XE-PM (kern_xepm.cpp, -wex-pm) first: DeviceInfo::create can block.
+ xePmInstall(patcher);
  auto info=DeviceInfo::create();if(!info)return;
  auto gpu=OSDynamicCast(IOPCIDevice,info->videoBuiltin);
  // Match WEG ordering: PCI config reads require a published IOPCIDevice.
@@ -58,9 +64,10 @@ void XeHost::processKernel(KernelPatcher &patcher) {
  active=profile.displayAdmitted();
 
  const auto display=XELP::displayAdapter(profile.family);
+ backlightPanelEDP=active && display==XELP::DisplayAdapter::ADLP && checkKernelArgument("-wex-adlp-edp");
  systemWakeRecovery=active && (display==XELP::DisplayAdapter::ADLP || display==XELP::DisplayAdapter::ADLN);
  backlightEnabled=active && (display==XELP::DisplayAdapter::TGL || display==XELP::DisplayAdapter::ADLS ||
-  display==XELP::DisplayAdapter::ADLP || display==XELP::DisplayAdapter::ADLN) &&
+  display==XELP::DisplayAdapter::ADLP || display==XELP::DisplayAdapter::ADLN || backlightPanelEDP) &&
   info->firmwareVendor!=DeviceInfo::FirmwareVendor::Apple;
  backlightGPU=backlightEnabled ? gpu : nullptr;
  if(published) {
@@ -184,6 +191,7 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   return;
  }
  if(backlight.loadIndex==index) {
+  if(backlightPanelEDP)dumpPanelACPITables();
   if(backlightEnabled) {
    KernelPatcher::RouteRequest route("__ZN15AppleIntelPanel10setDisplayEP9IODisplay",wrapPanelSetDisplay,orgPanelSetDisplay);
    const bool ready=patcher.routeMultiple(index,&route,1,address,size);
@@ -327,12 +335,18 @@ bool XeHost::wrapPanelSetDisplay(IOService *panel,IOService *display) {
  const bool range=owned && internal && framebuffer &&
   framebuffer->getAttributeForConnection(0,'bklt',pwm)==kIOReturnSuccess;
  OSDictionary *heldProfiles=nullptr;
+ // AppleIntelPanel selects F<UID>T<product>. The ADL-P eDP panel's SSDT-PNLF may
+ // report any UID; its 'bklt' range is WhateverXe's own 0..65535 DPCD scale.
+ unsigned uidValue=0;
+ if(uid)for(auto s=uid->getCStringNoCopy();*s>='0' && *s<='9' && uidValue<1000;++s)uidValue=uidValue*10+(*s-'0');
+ const unsigned profileUID=uidValue==19 || (callbackHost->backlightPanelEDP && uidValue) ? uidValue : 0;
  if(range && uid && product && pwm[1]<=UINT32_MAX && pwm[2]<=UINT32_MAX &&
-    XeBacklightProfile::eligible(uid->isEqualTo("19") ? 19 : 0,pwm[1],pwm[2],internal)) {
+    XeBacklightProfile::eligible(profileUID ? 19 : 0,pwm[1],pwm[2],internal)) {
   auto original=OSDynamicCast(OSDictionary,panel->getProperty("ApplePanels"));
   if(original && !panel->getProperty("ApplePanel")) {
-   char key[32];snprintf(key,sizeof(key),"F19T%04x",product->unsigned32BitValue());
-   if(!original->getObject(key) && !original->getObject("F19")) {
+   char key[32],family[16];snprintf(key,sizeof(key),"F%uT%04x",profileUID,product->unsigned32BitValue());
+   snprintf(family,sizeof(family),"F%u",profileUID);
+   if(!original->getObject(key) && !original->getObject(family)) {
     auto copy=OSDictionary::withDictionary(original);
     auto curve=OSData::withBytes(XeBacklightProfile::curve,sizeof(XeBacklightProfile::curve));
     if(copy && curve && copy->setObject(key,curve) && panel->setProperty("ApplePanels",copy)) {
@@ -346,7 +360,7 @@ bool XeHost::wrapPanelSetDisplay(IOService *panel,IOService *display) {
    }
   }
  }
- uint32_t inputs[]={1,owned,uid && uid->isEqualTo("19"),range ? static_cast<uint32_t>(pwm[1]) : ~0U,
+ uint32_t inputs[]={1,owned,profileUID,range ? static_cast<uint32_t>(pwm[1]) : ~0U,
   range ? static_cast<uint32_t>(pwm[2]) : 0,0};
  const bool result=FunctionCast(wrapPanelSetDisplay,callbackHost->orgPanelSetDisplay)(panel,display);
  if(heldProfiles)heldProfiles->release();
@@ -422,5 +436,22 @@ void XeHost::wrapFramebufferInit(IOFramebuffer *fb) {
 			memset(dst, 0, info.v_rowbytes * info.v_height);
 		}
 	}
+}
+
+// -wex-adlp-edp diagnostics: publish the firmware DSDT/SSDTs (read-only) so the
+// brightness-key notify target can be found; macOS no longer exposes them.
+static void dumpPanelACPITables() {
+ // Name-based checks only: WhateverXe does not link against IOACPIFamily.
+ auto entry=IORegistryEntry::fromPath("/_SB",IORegistryEntry::getPlane("IOACPIPlane"));
+ if(!entry)return;
+ if(!entry->metaCast("IOACPIPlatformDevice")){entry->release();return;}
+ auto sb=static_cast<IOACPIPlatformDevice *>(entry);
+ auto root=IORegistryEntry::getRegistryRoot();
+ if(auto dsdt=sb->getACPITableData("DSDT",0))root->setProperty("WEXACPI-DSDT",const_cast<OSData *>(dsdt));
+ for(unsigned i=0;i<32;++i) {
+  auto ssdt=sb->getACPITableData("SSDT",i);if(!ssdt)break;
+  char key[24];snprintf(key,sizeof(key),"WEXACPI-SSDT-%u",i);root->setProperty(key,const_cast<OSData *>(ssdt));
+ }
+ sb->release();
 }
 

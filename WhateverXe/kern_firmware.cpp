@@ -1,5 +1,6 @@
 #include "kern_xe.hpp"
 #include "kern_dsi_math.hpp"
+#include "kern_display13_firmware.hpp"
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IOMemoryDescriptor.h>
 
@@ -13,6 +14,7 @@ static void publishBytes(IOPCIDevice *pci,const char *key,const void *bytes,unsi
 void XE::xelpReadFirmware(IOPCIDevice *pci) {
     // Wiring is needed by framebuffer-only profiles before Render is admitted.
     if(!pci || !xeProfile.displayAdmitted())return;
+    display13PanelDP=xeProfile.mobileDisplay13() && checkKernelArgument("-wex-adlp-edp");
     const uint32_t asls=pci->configRead32(0xFC);
     uint32_t source=0;
     if(asls && asls<=0xFFFFE000U) {
@@ -30,14 +32,16 @@ void XE::xelpReadFirmware(IOPCIDevice *pci) {
                     auto vbtMap=vbtMemory ? vbtMemory->map(kIOMapReadOnly) : nullptr;
                     if(vbtMap && vbtMap->getVirtualAddress() && vbtMap->getLength()>=region.bytes) {
                         const auto data=reinterpret_cast<const void *>(vbtMap->getVirtualAddress());
-                        firmwarePorts=XELP::VBT::parse(data,region.bytes,xeProfile.family);
+                        publishBytes(pci,"WhateverXeVBTRaw",data,region.bytes);
+                        firmwarePorts=XELP::VBT::parse(data,region.bytes,xeProfile.family,display13PanelDP);
                         if(firmwarePorts.valid()){source=2;publishBytes(pci,"TGLVBT",data,firmwarePorts.bytes);}
                     }
                     if(vbtMap)vbtMap->release();
                     if(vbtMemory)vbtMemory->release();
                 }
                 if(!firmwarePorts.valid()) {
-                    const auto embedded=XELP::VBT::parse(bytes+0x400,region.inlineBytes,xeProfile.family);
+                    if(!region.address)publishBytes(pci,"WhateverXeVBTRaw",bytes+0x400,region.inlineBytes);
+                    const auto embedded=XELP::VBT::parse(bytes+0x400,region.inlineBytes,xeProfile.family,display13PanelDP);
                     if(embedded.valid()) {
                         firmwarePorts=embedded;source=1;
                         publishBytes(pci,"TGLVBT",bytes+0x400,firmwarePorts.bytes);
@@ -58,6 +62,11 @@ void XE::xelpReadFirmware(IOPCIDevice *pci) {
     const auto &panel=firmwarePorts.panel;
     uint32_t panelFacts[]={panel.valid,panel.type,panel.ddi,panel.lowSwing,panel.hobl};
     pci->setProperty("WhateverXeFirmwarePanel",panelFacts,sizeof(panelFacts));
+    if(display13PanelDP) {
+        uint32_t edp[]={1,firmwarePorts.duplicates,XELP::VBT::display13PanelDP(firmwarePorts),
+            panel.backlightValid,panel.pwmPresent,panel.backlightType,panel.controller};
+        pci->setProperty("WEXADLPPanelDP",edp,sizeof(edp));
+    }
     if(checkKernelArgument("-wex-dsi-audit")) {
         // Synchronous audit of the existing copied firmware property. Never
         // retain borrowed sequence pointers, acquire power, or authorize IO.
