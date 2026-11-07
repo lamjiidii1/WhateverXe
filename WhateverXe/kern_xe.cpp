@@ -1,5 +1,6 @@
 #include "kern_display13_color.hpp"
 #include <mach/clock.h>
+#include <kern/thread_call.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
 //
@@ -57,6 +58,7 @@
 #include "kern_tgl_combo_signal.hpp"
 #include "kern_tgl_panel_depth.hpp"
 #include "kern_xelp_panel_power.hpp"
+#include "kern_adlp_edp_readout.hpp"
 #include "kern_display13_panel.hpp"
 #include "kern_tgl_pcode_gate.hpp"
 #include "kern_tgl_pcode_edram.hpp"
@@ -323,10 +325,15 @@ bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 }
 }
 
+static void gpuResetTrace(uint32_t event,const void *object,uint64_t arg,uint64_t result);
+static void gpuResetDumpAfter(void *channel);
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
+	gpuResetTrace(1,channel,n,0);
 	const auto result=TGLRecovery::resetAndResume(channel);
+	gpuResetTrace(2,channel,n,result.resetOK|(uint64_t(result.failuresAfter)<<8));
+	gpuResetDumpAfter(channel);
 	uint64_t after {};clock_get_uptime(&after);
 	if (n<arrsize(tglRecoveryRecords)) {
 		auto q=tglRecoveryRecords[n];q[0]=123;q[1]=n+1;q[2]=before;q[3]=after;
@@ -3926,7 +3933,11 @@ Display13OutputWiring XE::display13BoardWiring(IOService *provider) {
     // Display13 physical capacity is shared by ADL-N and mobile ADL/RPL.
     // VBT chooses board routing; a family name must not exclude TC PHYs.
     Display13OutputWiring board;
-    if(!property)board=XELP::VBT::display13Fixed(firmwarePorts,Display13OutputWiring::Physical,xeProfile.family);
+    if(!property) {
+        board=XELP::VBT::display13Fixed(firmwarePorts,Display13OutputWiring::Physical,xeProfile.family);
+        if(display13PanelDP && board.valid)
+            board.dp|=XELP::VBT::display13PanelDP(firmwarePorts)&~board.hdmi;
+    }
     else {
         // Preserve the older ADL-N Combo property contract. It cannot select TC.
         if(adlpDisplaySelected)return {};
@@ -3972,7 +3983,7 @@ void XE::adlnBootstrap(IOPCIDevice *pci) {
 	// Bootstrap runs before framebuffer start loads its board policy. Native
 	// GOP qualification must already use that physical port, not assume B.
     const auto board=display13BoardWiring(pci);adlnOutputWiring=board;
-    if(displayRequested && !Display13FBTopology::supportedWiring(board,xeProfile.display==XELP::Display::XeLPD,checkKernelArgument("-wex-dsi-adopt"))) {
+    if(displayRequested && !Display13FBTopology::supportedWiring(board,xeProfile.display==XELP::Display::XeLPD,checkKernelArgument("-wex-dsi-adopt"),display13ComboDP())) {
         pci->setProperty("N97NativeRoutingUnavailable",true);return;
     }
     if(board.dsi && !prepareDSIFirmware(pci))return;
@@ -4346,9 +4357,11 @@ bool XE::xelpBindProbe(void *controller) {
         const bool dsi=adlnOutputWiring.dsi!=0;
         if(!display13FBTopologyHooksReady || controller!=adlnTopologyController ||
             (dsi && (!adlnOutputWiring.described() || !__atomic_load_n(&dsiResourcesReady,__ATOMIC_ACQUIRE))) ||
-            !Display13FBTopology::supportedWiring(dsi?external:adlnOutputWiring,xeProfile.display==XELP::Display::XeLPD) ||
+            !Display13FBTopology::supportedWiring(dsi?external:adlnOutputWiring,xeProfile.display==XELP::Display::XeLPD,false,display13ComboDP()) ||
             ((adlnOutputWiring.selected()&0x78) && (!display13TCProbeReady || !display13FBTCHooksReady)) ||
-            (adlnOutputWiring.dp && (!display13TCDPProbeReady || !display13FBSSTHooksReady || !display13FBAUXHooksReady)) ||
+            ((adlnOutputWiring.dp&0x78) && !display13TCDPProbeReady) ||
+            ((adlnOutputWiring.dp&3) && !display13DPProbeReady) ||
+            (adlnOutputWiring.dp && (!display13FBSSTHooksReady || !display13FBAUXHooksReady)) ||
             (adlnOutputWiring.typeC && !display13DPAltProbeReady) ||
             (adlnOutputWiring.panel && (!display13PanelProbeReady || !display13PanelPowerReady || !display13FBSSTHooksReady || !display13FBAUXHooksReady)))return false;
         config.combo=(adlnOutputWiring.selected()&~adlnOutputWiring.dsi)&3;config.comboBackend=3;
@@ -4433,11 +4446,19 @@ void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
                 physicalGPU->setProperty("ADLPScanoutBoot",display,sizeof(*display));
                 IOFree(display,sizeof(*display));
             } else physicalGPU->setProperty("ADLPReadoutAllocationFailed",true);
+            // ADLP_EDP_READOUT: firmware eDP path, PPS/backlight/PSR and sink DPCD.
+            static ADLPEDPReadout::Result edp;
+            ADLPEDPReadout::capture(io,edp,!checkKernelArgument("-wex-adlp-readout-noaux"));
+            physicalGPU->setProperty("ADLPEDPBoot",&edp,sizeof(edp));
+            SYSLOG("igfx","ADL-P eDP readout aux=%x power=%x dpcd=%u/%u",edp.auxBefore,edp.auxPower,
+                edp.windowsRead,ADLPEDPReadout::WindowCount);
+            // ADLP_EDP_READOUT_END
             SYSLOG("igfx","ADL-P readout status=%u fuses=%x/%x/%x/%x/%x release=%x/%x; donor blocked",
                 static_cast<unsigned>(gt.status),gt.fuses[0],gt.fuses[1],gt.fuses[2],gt.fuses[3],gt.fuses[4],
                 gt.releasedMask,gt.releaseFailedMask);
         }
         if(map)map->release();
+        xelpReadFirmware(physicalGPU); // VBT/OpRegion only; publishes TGLVBT
         return;
     }
     if(((display12SmallGTDetected && XELP::display12SmallGTDevice(xeProfile.identity)) || tglGT2Detected) &&
@@ -5572,6 +5593,13 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
     display13FBTCHooksReady=processDisplay13FramebufferTC(patcher,index,address,size);
     if(!(adlnOutputWiring.selected()&0x78) && adlnOutputWiring.panel)processDisplay13Training(patcher,index,address,size);
     IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCHooksReady",display13FBTCHooksReady);
+    // -wex-adlp-edp: Combo-only fixed DP uses the native Combo clock routes
+    // installed by the output stage plus the shared training lease adapter.
+    if(display13PanelDP && (adlnOutputWiring.dp&3) && !(adlnOutputWiring.selected()&0x78)) {
+        display13ComboDPReady=display13FBOutputHooksReady && display13FBSSTHooksReady && display13FBAUXHooksReady &&
+            processDisplay13Training(patcher,index,address,size);
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13ComboDPReady",display13ComboDPReady);
+    }
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBOutputHooksReady",display13FBOutputHooksReady);
 	display13FBGTTHooksReady=processDisplay13FramebufferGTT(patcher,index,address,size);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBGTTHooksReady",display13FBGTTHooksReady);
@@ -6668,6 +6696,9 @@ IOReturn XE::wrapAlderLakeNDSBSetup(IOService *controller) {return adlnSetupAuxi
 
 
 
+static uint64_t display13FBState(IOService *fb);
+static uint64_t display13LinkState();
+static void display13PanelLiveState();
 bool XE::processDisplay13FramebufferTopology(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
 	const char *os="__ZN31AppleIntelFramebufferController16getOSInformationEv";
 	const char *state="__ZN14AppleIntelPort14probePortStateEv";
@@ -6697,7 +6728,7 @@ bool XE::processDisplay13FramebufferTopology(KernelPatcher &patcher,size_t index
 bool XE::wrapAlderLakeNGetOSInformation(IOService *controller) {
 	auto s=callbackXE;
 	if(!s->display13FBTopologyHooksReady || !controller || controller->getMetaClass()->getClassSize()<0x1C20 ||
-		!Display13FBTopology::supportedWiring(s->adlnOutputWiring,s->xeProfile.display==XELP::Display::XeLPD,checkKernelArgument("-wex-dsi-adopt")) || !checkKernelArgument("-disablegfxfirmware"))return false;
+		!Display13FBTopology::supportedWiring(s->adlnOutputWiring,s->xeProfile.display==XELP::Display::XeLPD,checkKernelArgument("-wex-dsi-adopt"),s->display13ComboDP()) || !checkKernelArgument("-disablegfxfirmware"))return false;
 	if(!FunctionCast(wrapAlderLakeNGetOSInformation,s->orgAlderLakeNGetOSInformation)(controller))return false;
 	auto platform=Display13FBMemory::field<void *>(controller,0xD40);
 	if(!Display13FBTopology::apply(s->adlnPlatform,sizeof(s->adlnPlatform),platform,s->adlnOutputWiring))return false;
@@ -6780,6 +6811,7 @@ uint32_t XE::wrapAlderLakeNPortState(OSObject *port) {
         root->setProperty("N97FBPortProbeEntry",r,sizeof(r));
         const auto result=FunctionCast(wrapAlderLakeNPortState,s->orgAlderLakeNPortState)(port); // Real selected HPD/EDID path.
         r[7]=result;r[8]=Display13FBMemory::field<uint32_t>(port,0x550);r[9]=Display13FBMemory::field<uint32_t>(port,0x554);
+        display13PanelTrace(4,config[0],result,r[8],r[9],display13LinkState());
         root->setProperty("N97FBPortProbeLast",r,sizeof(r));
         if(call<=16) {char key[40];snprintf(key,sizeof(key),"N97FBPortProbeFirst%u",call);root->setProperty(key,r,sizeof(r));}
         return result;
@@ -6910,7 +6942,7 @@ void XE::wrapDisplay13TCEnableClocks(void *controller,void *raw,void *other,uint
     auto self=callbackXE;auto port=static_cast<OSObject *>(raw);auto &c=display13FBPower;
     auto config=port && port->getMetaClass()->getClassSize()>=0x580 ? Display13FBMemory::field<uint32_t *>(port,0x548):nullptr;
     if(config && config[0]<3) {
-        bool keep=false;
+        bool keep=false;display13PanelTrace(9,config[0],0,display13LinkState());
         if(!comboClockTarget(controller,raw,other) || !comboBeginClock(controller,raw,true,keep,other)) {
             adlnFault(c.clockFaulted,__LINE__);return;
         }
@@ -6951,7 +6983,7 @@ void XE::wrapDisplay13TCDisableClocks(void *controller,void *raw,void *other) {
     auto config=port && port->getMetaClass()->getClassSize()>=0x580 ? Display13FBMemory::field<uint32_t *>(port,0x548):nullptr;
     if(config && config[0]<3) {
         if((self->adlnOutputWiring.links()&(1U<<config[0])) && self->display13ClockOrderReady && !display13StopTranscoder(raw))return;
-        bool keep=false;
+        bool keep=false;display13PanelTrace(10,config[0],0,display13LinkState());
         if(!comboClockTarget(controller,raw,other) || !comboBeginClock(controller,raw,false,keep)) {
             adlnFault(c.clockFaulted,__LINE__);return;
         }
@@ -7296,6 +7328,7 @@ bool XE::processDisplay13FramebufferOutput(KernelPatcher &patcher,size_t index,m
     const bool complete=ready && comboReady && processDisplay13FramebufferColor(patcher,index,address,size) &&
         processDisplay13FramebufferSST(patcher,index,address,size) && processDisplay13FramebufferAUX(patcher,index,address,size);
     adlnComboPLLFractionCaller=complete ? address+0x6D973 : 0;
+    if(complete && display13PanelDP)processDisplay13PanelTrace(patcher,index,address,size);
     return complete;
 }
 
@@ -7360,18 +7393,460 @@ bool XE::display13AUXReady(void *port,bool command,bool retained) {
  Display13FBPowerIO io {c.map};return c.bridge.beginAUXCommand(io,config[0]);
 }
 
+// -wex-adlp-edp diagnostics. Writes are recorded lock-free from the register
+// writer; publication happens from the AUX failure path (thread context).
+struct Display13PanelWrite {uint32_t reg,original,value,caller;};
+static Display13PanelWrite display13PanelWrites[48];
+static volatile uint32_t display13PanelWriteCount;
+void XE::display13PanelWriteRecord(uint32_t reg,uint32_t original,uint32_t value,uintptr_t caller) {
+ const auto n=__sync_fetch_and_add(&display13PanelWriteCount,1);
+ const auto image=callbackXE->framebufferClockImage;
+ display13PanelWrites[n%48]={reg,original,value,uint32_t(image && caller>=image ? caller-image : 0xFFFFFFFFU)};
+}
+void XE::display13AUXFailRecord(void *port,uint32_t result,uint32_t command) {
+ auto &c=display13FBPower;static volatile uint32_t count;
+ const auto n=__sync_add_and_fetch(&count,1);
+ if(n>4 && n%64)return; // first four, then every 64th
+ uint64_t r[46] {3,n,result,command};
+ auto object=static_cast<OSObject *>(port);
+ if(object && object->getMetaClass()->getClassSize()>=0x580) {
+  r[4]=Display13FBMemory::field<uint32_t>(port,0x120);r[5]=Display13FBMemory::field<uint32_t>(port,0x550);
+  r[6]=Display13FBMemory::field<uint32_t>(port,0x554);
+ }
+ if(c.lock) {
+  IOLockLock(c.lock);
+  if(c.map && c.map->getVirtualAddress()) {
+   Display13FBSSTIO io{c.map};
+   const uint32_t regs[]={0x45404,0x45440,0x45444,0x45454,0x64000,0x64010,0xC7200,0xC7204,0xC4000,0xC4030,
+    0x60400,0x70008,0x46140,0x164280,0x46014,0x60540};
+   for(unsigned i=0;i<arrsize(regs);++i)r[7+i]=(uint64_t(regs[i])<<32)|io.read(regs[i]);
+   // DC state, DC debug counters, Combo PHY A misc/compensation/lane power.
+   const uint32_t extra[]={0x45504,0x101084,0x101088,0x64C00,0x162100,0x162028};
+   for(unsigned i=0;i<arrsize(extra);++i)r[40+i]=(uint64_t(extra[i])<<32)|io.read(extra[i]);
+  }
+  auto &b=c.bridge;auto &link=c.mainLink[0];
+  r[23]=b.begun|(b.state.faulted<<1)|(b.state.suspended<<2)|(b.bootAdopted<<3)|(c.clockFaulted<<4)|(c.memoryFaulted<<5)|(c.clockStopped<<6);
+  r[24]=b.auxRefs[0];r[25]=b.ddiRefs[0];r[26]=b.auxCommands[0];r[27]=b.auxLease[0].domains;
+  r[28]=link.owner!=0;r[29]=link.bootPending;r[30]=link.lease.domains;r[31]=b.state.owned;r[32]=b.state.borrowed;
+  for(unsigned i=0;i<6;++i)r[33+i]=b.state.refs[i];
+  IOLockUnlock(c.lock);
+ }
+ r[39]=display13PanelWriteCount;
+ auto root=IORegistryEntry::getRegistryRoot();
+ if(n==1)root->setProperty("WEXDisplay13AUXFailFirst",r,sizeof(r));
+ root->setProperty("WEXDisplay13AUXFailLast",r,sizeof(r));
+ display13PanelTrace(5,n,result,command,r[12]&0xFFFFFFFFU,r[11]&0xFFFFFFFFU);
+ Display13PanelWrite copy[48];memcpy(copy,display13PanelWrites,sizeof(copy));
+ root->setProperty("WEXDisplay13PanelWrites",copy,sizeof(copy));
+ root->setProperty("WEXDisplay13PanelWriteCount",display13PanelWriteCount,32);
+}
+
+// Ordered event trace for the -wex-adlp-edp bring-up. Each entry:
+// {mach time, event, a..e}. Published after every event except AUX failures,
+// which are throttled by their own recorder.
+struct Display13PanelTraceEntry {uint64_t time,event,a,b,c,d,e;};
+static Display13PanelTraceEntry display13PanelTraceRing[400];
+static volatile uint32_t display13PanelTraceCount;
+// Rolling ring for later events (sleep/wake); per-frame VBL events excluded.
+static Display13PanelTraceEntry display13PanelRecentRing[512];
+static volatile uint32_t display13PanelRecentCount;
+void XE::display13PanelTrace(uint32_t event,uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e) {
+ if(!callbackXE || !callbackXE->display13PanelDP)return;
+ const auto now=mach_absolute_time();
+ if(event!=31 && event!=32) {
+  const auto r=__sync_fetch_and_add(&display13PanelRecentCount,1);
+  display13PanelRecentRing[r%arrsize(display13PanelRecentRing)]={now,event,a,b,c,d,e};
+  if(event!=5 || !(r&15)) {
+   auto root=IORegistryEntry::getRegistryRoot();
+   root->setProperty("WEXPanelTraceRecent",display13PanelRecentRing,sizeof(display13PanelRecentRing));
+   root->setProperty("WEXPanelTraceRecentCount",r+1,32);
+  }
+ }
+ const auto n=__sync_fetch_and_add(&display13PanelTraceCount,1);
+ if(n>=arrsize(display13PanelTraceRing))return; // keep the boot-time prefix
+ display13PanelTraceRing[n]={now,event,a,b,c,d,e};
+ if(event==5 && n>8)return;
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXPanelTrace",display13PanelTraceRing,
+  sizeof(Display13PanelTraceEntry)*(n+1));
+}
+static uint64_t display13FBState(IOService *fb) {
+ if(!fb || fb->getMetaClass()->getClassSize()<0x4B90)return UINT64_MAX;
+ // 0x1DC index | 0x1E0 online | 0x1E1 | 0x1E2 | 0x1E4 | 0x1E6 | 0x44E0 flags
+ return uint64_t(Display13FBMemory::field<uint32_t>(fb,0x1DC)&0xFF) |
+  (uint64_t(Display13FBMemory::field<uint8_t>(fb,0x1E0))<<8) | (uint64_t(Display13FBMemory::field<uint8_t>(fb,0x1E1))<<16) |
+  (uint64_t(Display13FBMemory::field<uint8_t>(fb,0x1E2))<<24) | (uint64_t(Display13FBMemory::field<uint8_t>(fb,0x1E4))<<32) |
+  (uint64_t(Display13FBMemory::field<uint8_t>(fb,0x1E6))<<40) | (uint64_t(Display13FBMemory::field<uint16_t>(fb,0x44E0))<<48);
+}
+// -wex-adlp-edp: live plane/pipe/link/IRQ state of pipe A and DDI A, kept as
+// first-after-modeset and latest snapshots (read-only MMIO).
+static void display13PanelLiveState() {
+ auto &c=display13FBPower;if(!c.map || !c.map->getVirtualAddress())return;
+ Display13FBSSTIO io{c.map};
+ static const uint32_t regs[]={0x70180,0x70188,0x7018C,0x70190,0x7019C,0x701A4,0x701AC,0x70008,0x70040,0x60400,
+  0x60540,0x60544,0x64000,0x46140,0x164280,0x46010,0x46014,0x16428C,0x164290,0x44400,0x44404,0x4440C,
+  0x44200,0x44204,0x4420C,0xC4000,0x6001C,0x60030,0x60040,0x42084,0x70028,0x45404};
+ uint64_t r[2+arrsize(regs)] {1,mach_absolute_time()};
+ for(unsigned i=0;i<arrsize(regs);++i)r[2+i]=(uint64_t(regs[i])<<32)|io.read(regs[i]);
+ static bool first;
+ const bool modeset=!(io.read(0x60400)&0x80000000U) || (io.read(0x64000)&0xEU)!=0x6U;
+ auto root=IORegistryEntry::getRegistryRoot();
+ if(modeset && !first){first=true;root->setProperty("WEXPanelLiveFirst",r,sizeof(r));}
+ root->setProperty("WEXPanelLiveLast",r,sizeof(r));
+}
+static uint64_t display13LinkState() {
+ auto &c=display13FBPower;if(!c.map || !c.map->getVirtualAddress())return UINT64_MAX;
+ Display13FBSSTIO io{c.map};
+ // DDI_BUF_CTL_A | TRANS_DDI_FUNC_CTL_A<<32 (enable bits are what matter)
+ return uint64_t(io.read(0x64000))|(uint64_t(io.read(0x60400))<<32);
+}
+uint32_t XE::wrapPanelConnectionChanged(IOService *fb) {
+ display13PanelTrace(20,display13FBState(fb),display13LinkState());
+ const auto r=FunctionCast(wrapPanelConnectionChanged,callbackXE->orgPanelConnectionChanged)(fb);
+ display13PanelTrace(21,display13FBState(fb),display13LinkState(),r);
+ return r;
+}
+uint32_t XE::wrapPanelGetOnlineInfo(IOService *fb,void *path,uint8_t *online,uint8_t *info) {
+ display13PanelTrace(22,display13FBState(fb),display13LinkState());
+ const auto r=FunctionCast(wrapPanelGetOnlineInfo,callbackXE->orgPanelGetOnlineInfo)(fb,path,online,info);
+ uint64_t port=0;
+ if(path && static_cast<OSObject *>(path)->getMetaClass()->getClassSize()>=0x3730) {
+  auto p=Display13FBMemory::field<uint8_t *>(path,0x3648);
+  if(p)port=uint64_t(p[0x16])|(uint64_t(p[0x17])<<8)|(uint64_t(p[0x18])<<16)|(uint64_t(p[0x116])<<24)|
+   (uint64_t(p[0xF8])<<32)|(uint64_t(Display13FBMemory::field<uint32_t>(p,0x554)&0xFF)<<40)|
+   (uint64_t(Display13FBMemory::field<uint32_t>(p,0x550)&0xFF)<<48);
+ }
+ display13PanelTrace(23,display13FBState(fb),online?*online:0xFF,r,port,display13LinkState());
+ return r;
+}
+// AppleIntelFramebuffer::connectionProbe treats FB0 as the built-in panel and
+// clears its connected byte (+1E1) for clamshell/external-display policy. In
+// -wex-adlp-edp the panel itself is the only output, so a clear on a live,
+// online FB0 with Combo A transmitting would blank the only display.
+uint32_t XE::wrapPanelConnectionProbe(IOService *fb) {
+ const bool sized=fb && fb->getMetaClass()->getClassSize()>=0x4B90;
+ const auto before=sized ? Display13FBMemory::field<uint8_t>(fb,0x1E1) : 0;
+ const auto r=FunctionCast(wrapPanelConnectionProbe,callbackXE->orgPanelConnectionProbe)(fb);
+ if(!sized)return r;
+ const auto after=Display13FBMemory::field<uint8_t>(fb,0x1E1);
+ auto controller=Display13FBMemory::field<uint8_t *>(fb,0x1D0);
+ uint64_t policy=UINT64_MAX;
+ if(controller)policy=uint64_t(Display13FBMemory::field<uint32_t>(controller,0xD5C)&0xFF)|
+  (uint64_t(controller[0xE54])<<8)|(uint64_t(controller[0xE55])<<16)|(uint64_t(controller[0xE56])<<24);
+ const auto link=display13LinkState();
+ const bool restore=before && !after && Display13FBMemory::field<uint32_t>(fb,0x1DC)==0 &&
+  Display13FBMemory::field<uint8_t>(fb,0x1E0) && link!=UINT64_MAX && (link&0x80000000U) && ((link>>32)&0x80000000U);
+ if(restore)*reinterpret_cast<uint8_t *>(reinterpret_cast<uint8_t *>(fb)+0x1E1)=1;
+ if(before!=after || restore)display13PanelTrace(24,display13FBState(fb),before|(uint64_t(after)<<8)|(uint64_t(restore)<<16),r,policy,link);
+ return r;
+}
+// enableController starts an adopted online FB in kIOFBBootProgrammable
+// (-5). getCurrentDisplayMode replaces it only when the hardware timing it
+// reconstructs matches an EDID mode exactly; on this route it does not, and
+// CoreDisplay then cannot describe the mode and leaves the panel offline.
+// Select the EDID mode whose active size matches the live transcoder.
+uint32_t XE::wrapPanelCurrentMode(IOService *fb,int *mode,int *depth) {
+ const auto r=FunctionCast(wrapPanelCurrentMode,callbackXE->orgPanelCurrentMode)(fb,mode,depth);
+ if(r || !fb || fb->getMetaClass()->getClassSize()<0x4B90 || Display13FBMemory::field<int32_t>(fb,0x4250)!=-5 ||
+    Display13FBMemory::field<uint32_t>(fb,0x1DC)!=0 || !Display13FBMemory::field<uint8_t>(fb,0x1E0))return r;
+ auto &c=display13FBPower;if(!c.map || !c.map->getVirtualAddress())return r;
+ Display13FBSSTIO io{c.map};
+ const auto ht=io.read(0x60000),vt=io.read(0x6000C);
+ if(ht==UINT32_MAX || vt==UINT32_MAX || !(io.read(0x60400)&0x80000000U))return r;
+ const uint32_t width=(ht&0x3FFF)+1,height=(vt&0x3FFF)+1;
+ auto list=OSDynamicCast(OSArray,Display13FBMemory::field<OSObject *>(fb,0x4260));
+ uint64_t first[4] {UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX};
+ int32_t chosen=-5;unsigned count=list?list->getCount():0;
+ for(unsigned i=0;i<count;++i) {
+  auto data=OSDynamicCast(OSData,list->getObject(i));
+  if(!data || data->getLength()<0x58)continue;
+  auto b=static_cast<const uint8_t *>(data->getBytesNoCopy());
+  const int32_t id=*reinterpret_cast<const int32_t *>(b);
+  const uint32_t h=*reinterpret_cast<const uint32_t *>(b+0x40),v=*reinterpret_cast<const uint32_t *>(b+0x50);
+  if(i==0){first[0]=uint32_t(id);first[1]=*reinterpret_cast<const uint64_t *>(b+0x28);first[2]=(uint64_t(h)<<32)|v;
+   first[3]=(uint64_t(*reinterpret_cast<const uint32_t *>(b+0x18))<<32)|*reinterpret_cast<const uint32_t *>(b+0x1C);}
+  if(h==width && v==height){chosen=id;break;}
+ }
+ // Until CoreDisplay installs the EDID timings (setDetailedTimings), the
+ // donor has no mode list and cannot describe -5 at all, while CoreDisplay
+ // will not install timings for a display whose current mode it cannot
+ // describe. Report the first EDID detailed-timing ID (the panel's native
+ // mode, which is the timing the firmware left running) to break the cycle.
+ if(chosen==-5 && !count)chosen=int32_t(0x80001000);
+ display13PanelTrace(25,(uint64_t(width)<<32)|height,count,uint32_t(chosen),first[1],first[2]);
+ if(chosen==-5)return r;
+ *reinterpret_cast<int32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4250)=chosen;
+ if(mode)*mode=chosen;
+ return r;
+}
+// setupDisplayTiming fills its output only when the AGDC link validation
+// callback succeeds; otherwise it returns with the caller's uninitialized
+// stack timing, which hwSetMode then programs (garbage scanout) until
+// SetupTimings divides by a zero total. Zero the output first and, if the
+// donor left it empty, program the requested timing unchanged.
+void XE::wrapPanelSetupTiming(IOService *fb,const void *timing,void *out) {
+ constexpr size_t Bytes=0xA0; // hwSetMode copies 0xA0 bytes of this record
+ if(out)bzero(out,Bytes);
+ FunctionCast(wrapPanelSetupTiming,callbackXE->orgPanelSetupTiming)(fb,timing,out);
+ if(!timing || !out)return;
+ auto in=static_cast<const uint8_t *>(timing);auto o=static_cast<uint8_t *>(out);
+ const auto field=[](const uint8_t *p,size_t off){uint32_t v;memcpy(&v,p+off,4);return v;};
+ uint64_t clock=0;memcpy(&clock,in+0x28,8);
+ const bool empty=!field(o,0x40) || !field(o,0x50) || !(field(o,0x40)+field(o,0x44)) || !(field(o,0x50)+field(o,0x54));
+ const bool usable=field(in,0x40) && field(in,0x50) && clock;
+ if(empty && usable)memcpy(out,timing,Bytes);
+ display13PanelTrace(27,(uint64_t(field(in,0x40))<<32)|field(in,0x50),clock,
+  (uint64_t(field(o,0x40))<<32)|field(o,0x50),empty|(uint64_t(empty && usable)<<1),
+  fb && fb->getMetaClass()->getClassSize()>=0x4B90 ? uint32_t(Display13FBMemory::field<int32_t>(fb,0x4250)) : UINT32_MAX);
+}
+// hwSetInterruptState drops a request while the FB has no active display
+// path (+4A00 == 0), which is the case inside a modeset. A VBL enable lost
+// there is never re-applied, so every later flip fails ("Flip called
+// without enabling VBL"). Remember the last rejected request for FB0 and
+// replay it once the path exists again.
+struct Display13PendingInterrupt {void *controller,*ref;uint32_t state;IOService *fb;bool pending;};
+static Display13PendingInterrupt display13PendingVBL;
+static mach_vm_address_t display13OrgInterruptState;
+static uint32_t display13FBPathCount(IOService *fb) {
+ if(!fb || fb->getMetaClass()->getClassSize()<0x4B90)return 0;
+ return Display13FBMemory::field<int32_t>(fb,0x3FD8)==-1 ? Display13FBMemory::field<uint32_t>(fb,0x49E8) :
+  Display13FBMemory::field<uint32_t>(fb,0x4A00);
+}
+uint32_t XE::wrapPanelInterruptState(void *controller,void *ref,uint32_t state,IOService *fb) {
+ const auto paths=display13FBPathCount(fb);
+ const auto r=FunctionCast(wrapPanelInterruptState,callbackXE->orgPanelInterruptState)(controller,ref,state,fb);
+ const bool fb0=fb && fb->getMetaClass()->getClassSize()>=0x4B90 && Display13FBMemory::field<uint32_t>(fb,0x1DC)==0;
+ if(fb0) {
+  if(r && !paths)display13PendingVBL={controller,ref,state,fb,true};
+  else if(display13PendingVBL.ref==ref)display13PendingVBL.pending=false;
+  display13PanelTrace(31,state,r,paths,controller ? Display13FBMemory::field<uint32_t>(controller,0xE14) : UINT32_MAX,
+   uint64_t(display13PendingVBL.pending));
+ }
+ return r;
+}
+void XE::display13ReplayVBL() {
+ auto &p=display13PendingVBL;
+ if(!p.pending || !p.fb || !display13FBPathCount(p.fb) || !display13OrgInterruptState)return;
+ p.pending=false;
+ const auto r=reinterpret_cast<uint32_t (*)(void *,void *,uint32_t,IOService *)>(display13OrgInterruptState)(p.controller,p.ref,p.state,p.fb);
+ display13PanelTrace(32,p.state,r,display13FBPathCount(p.fb),Display13FBMemory::field<uint32_t>(p.controller,0xE14));
+}
+// Before CoreDisplay installs the EDID timings, the donor cannot describe
+// any mode, so IOAccelDisplayPipe::init_framebuffer_resource fails for FB0
+// and every later display pipe transaction is rejected. Describe the
+// panel's native EDID mode (the timing the firmware left running) as the
+// first detailed timing while FB0 has no list, like a real boot mode.
+static uint8_t display13NativeTiming[0xA0];
+static void display13BuildNativeTiming() {
+ auto t=display13NativeTiming;bzero(t,sizeof(display13NativeTiming));
+ const auto put32=[t](size_t off,uint32_t v){memcpy(t+off,&v,4);};
+ const auto put64=[t](size_t off,uint64_t v){memcpy(t+off,&v,8);};
+ const auto put16=[t](size_t off,uint16_t v){memcpy(t+off,&v,2);};
+ put32(0x00,0x80001000);                       // detailed-timing mode ID
+ put64(0x28,329630000ULL);put64(0x30,329630000ULL);put64(0x38,329630000ULL);
+ put32(0x40,2880);put32(0x44,80);put32(0x48,8);put32(0x4C,32);   // EDID DTD 1
+ put32(0x50,1800);put32(0x54,56);put32(0x58,6);put32(0x5C,8);
+ put32(0x80,1);                                 // one link
+ put16(0x88,1);put16(0x8A,2);put16(0x8C,1);put16(0x8E,1); // RGB444, 8 bpc, sRGB, full
+}
+uint32_t XE::wrapPanelValidateMode(IOService *fb,int mode,const void **desc,const void **timing) {
+ const auto r=FunctionCast(wrapPanelValidateMode,callbackXE->orgPanelValidateMode)(fb,mode,desc,timing);
+ if(!r || mode!=int(0x80001000) || !fb || fb->getMetaClass()->getClassSize()<0x4B90 ||
+    Display13FBMemory::field<uint32_t>(fb,0x1DC)!=0 || !Display13FBMemory::field<uint8_t>(fb,0x1E0))return r;
+ auto list=OSDynamicCast(OSArray,Display13FBMemory::field<OSObject *>(fb,0x4260));
+ if(list && list->getCount())return r;
+ static bool built;if(!built){display13BuildNativeTiming();built=true;}
+ if(desc)*desc=reinterpret_cast<const void *>(callbackXE->panelProgrammedMode);
+ if(timing)*timing=display13NativeTiming;
+ static uint32_t count;if(++count<=4)display13PanelTrace(33,uint32_t(mode),r,count);
+ return 0;
+}
+uint32_t XE::display13PanelSetBrightness(IOService *fb,uint32_t value) {
+ auto s=callbackXE;
+ auto path=Display13FBMemory::singlePath<OSObject *>(fb);
+ auto port=path && path->getMetaClass()->getClassSize()>=0x3730 ? Display13FBMemory::field<void *>(path,0x3648) : nullptr;
+ if(!port)return kIOReturnNotReady;
+ // VESA eDP backlight block 0x720..0x72F. With a two-byte brightness the
+ // level is right-aligned to PWMGEN_BIT_COUNT (0x724), as in drm_edp_backlight:
+ // max = (1 << bits) - 1. A full-range 16-bit value overflows and goes dark.
+ static uint8_t block[16];static uint32_t bits;uint32_t r=0;
+ if(!bits) {
+  r=wrapDisplay13ReadAUX(port,0x720,block,sizeof(block));
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXPanelBacklightDPCD",block,sizeof(block));
+  if(r)return r;
+  uint32_t count=block[4]&0x1F;const uint32_t capMin=block[5]&0x1F,capMax=block[6]&0x1F;
+  if(!count || count>16) {
+   // Unset: select the largest supported count, as Linux does.
+   count=capMax && capMax<=16 ? capMax : 0;
+   if(count && count>=capMin) {uint8_t c=uint8_t(count);r=wrapDisplay13WriteAUX(port,0x724,&c,1);if(r)return r;}
+  }
+  if(!count || count>16)return kIOReturnUnsupported;
+  bits=count;
+ }
+ // 'bklt' 0 is "panel off" (lid closed with sleep disabled, dim to off,
+ // lowest key step), as on Apple panels. Write DPCD level 0: the OLED goes
+ // dark and any later level restores it. BACKLIGHT_ENABLE (0x720 bit 0) is
+ // not used for this: the panel reports it clear while lit (BL_EN pin) and
+ // does not come back when it is set again.
+ const uint32_t max=(1U<<bits)-1,floor=max/128 ? max/128 : 1;
+ uint32_t level=uint32_t((uint64_t(value>0xFFFF ? 0xFFFF : value)*max+0x7FFF)/0xFFFF);
+ if(value && level<floor)level=floor;
+ if(!value)level=0;
+ uint8_t bytes[2]={uint8_t(level>>8),uint8_t(level)};
+ r=wrapDisplay13WriteAUX(port,0x722,bytes,2);
+ if(!r && !s->panelBrightnessDPCD) {
+  // Level first, then DPCD control (0x721 bits 1:0 = 2) and AUX enable (0x720 bit 0).
+  uint8_t mode=uint8_t((block[1]&~3U)|2U),control=uint8_t(block[0]|1U);
+  r=wrapDisplay13WriteAUX(port,0x721,&mode,1);
+  if(!r && control!=block[0])r=wrapDisplay13WriteAUX(port,0x720,&control,1);
+  if(!r)s->panelBrightnessDPCD=true;
+ }
+ IOLog("WhateverXe: panel bklt %#x -> DPCD %#x res %#x\n",value,level,r);
+ display13PanelTrace(34,value,level,r,(uint64_t(bits)<<8)|s->panelBrightnessDPCD);
+ return r;
+}
+uint32_t XE::wrapPanelSetAttr(IOService *fb,int connection,uint32_t attribute,uintptr_t value) {
+ auto s=callbackXE;
+ if(s->display13PanelDP && attribute=='bklt' && !connection && fb && fb->getMetaClass()->getClassSize()>=0x4B90 &&
+    !Display13FBMemory::field<uint32_t>(fb,0x1DC)) {
+  s->panelBrightness=value>0xFFFF ? 0xFFFF : uint32_t(value);
+  const auto r=display13PanelSetBrightness(fb,s->panelBrightness);
+  return r ? r : kIOReturnSuccess;
+ }
+ return FunctionCast(wrapPanelSetAttr,s->orgPanelSetAttr)(fb,connection,attribute,value);
+}
+bool XE::processDisplay13PanelTrace(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ const char *changed="__ZN21AppleIntelFramebuffer17connectionChangedEv";
+ const char *online="__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_";
+ const uint8_t changedEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x81,0xec,0xa0,0,0,0};
+ const uint8_t onlineEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x98,0,0,0};
+ const auto c=patcher.solveSymbol<mach_vm_address_t>(index,changed,address,size);patcher.clearError();
+ const auto o=patcher.solveSymbol<mach_vm_address_t>(index,online,address,size);patcher.clearError();
+ if(c!=address+0x2E0E6 || o!=address+0x2E232 || memcmp(reinterpret_cast<void *>(c),changedEntry,sizeof(changedEntry)) ||
+    memcmp(reinterpret_cast<void *>(o),onlineEntry,sizeof(onlineEntry)))return false;
+ const char *probe="__ZN21AppleIntelFramebuffer15connectionProbeEv";
+ const uint8_t probeEntry[]={0x55,0x48,0x89,0xe5,0x41,0x56,0x53,0x48,0x83,0xec,0x10};
+ const auto p=patcher.solveSymbol<mach_vm_address_t>(index,probe,address,size);patcher.clearError();
+ if(p!=address+0x2DDF0 || memcmp(reinterpret_cast<void *>(p),probeEntry,sizeof(probeEntry)))return false;
+ const char *current="__ZN21AppleIntelFramebuffer21getCurrentDisplayModeEPiS0_";
+ const uint8_t currentEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0xa8,0,0,0};
+ const auto m=patcher.solveSymbol<mach_vm_address_t>(index,current,address,size);patcher.clearError();
+ if(m!=address+0x32A88 || memcmp(reinterpret_cast<void *>(m),currentEntry,sizeof(currentEntry)))return false;
+ const char *timingSym="__ZN21AppleIntelFramebuffer18setupDisplayTimingEPK29IODetailedTimingInformationV2PS0_";
+ const uint8_t timingEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x81,0xec,0xb0,0,0,0};
+ const auto t=patcher.solveSymbol<mach_vm_address_t>(index,timingSym,address,size);patcher.clearError();
+ if(t!=address+0x6814C || memcmp(reinterpret_cast<void *>(t),timingEntry,sizeof(timingEntry)))return false;
+ const char *irqSym="__ZN31AppleIntelFramebufferController19hwSetInterruptStateEPvjP21AppleIntelFramebuffer";
+ const uint8_t irqEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x38};
+ const auto q=patcher.solveSymbol<mach_vm_address_t>(index,irqSym,address,size);patcher.clearError();
+ if(q!=address+0x7229A || memcmp(reinterpret_cast<void *>(q),irqEntry,sizeof(irqEntry)))return false;
+ const char *validSym="__ZN21AppleIntelFramebuffer19validateDisplayModeEiPPKNS_15ModeDescriptionEPPK29IODetailedTimingInformationV2";
+ const uint8_t validEntry[]={0x55,0x48,0x89,0xe5,0x41,0x56,0x53};
+ const auto v=patcher.solveSymbol<mach_vm_address_t>(index,validSym,address,size);patcher.clearError();
+ const auto pm=patcher.solveSymbol<mach_vm_address_t>(index,"__ZL14programmedMode",address,size);patcher.clearError();
+ if(v!=address+0x30DE2 || pm!=address+0x98670 || memcmp(reinterpret_cast<void *>(v),validEntry,sizeof(validEntry)))return false;
+ panelProgrammedMode=pm;
+ KernelPatcher::RouteRequest routes[]={{changed,wrapPanelConnectionChanged,orgPanelConnectionChanged},
+  {online,wrapPanelGetOnlineInfo,orgPanelGetOnlineInfo},{probe,wrapPanelConnectionProbe,orgPanelConnectionProbe},
+  {current,wrapPanelCurrentMode,orgPanelCurrentMode},{timingSym,wrapPanelSetupTiming,orgPanelSetupTiming},
+  {irqSym,wrapPanelInterruptState,orgPanelInterruptState},{validSym,wrapPanelValidateMode,orgPanelValidateMode}};
+ const bool ok=patcher.routeMultipleShort(index,routes,arrsize(routes),address,size);patcher.clearError();
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXPanelTraceReady",ok);
+ display13OrgInterruptState=ok ? orgPanelInterruptState : 0;
+ // IntelFBClientControl::doAttribute forwards AGDC's per-FB online request to
+ // SetFbStatusOnNextProbe, which clears FB0's connected byte when the donor
+ // sees no built-in panel. The panel is the only output here: make the AGDC
+ // request a successful no-op (xor eax,eax) at its single call site.
+ const uint8_t agdcFind[]={0x48,0x8b,0x7d,0xd0,0x48,0x89,0xd6,0xe8,0xd6,0x97,0xfd,0xff};
+ const uint8_t agdcRepl[]={0x48,0x8b,0x7d,0xd0,0x48,0x89,0xd6,0x31,0xc0,0x90,0x90,0x90};
+ bool agdc=false;
+ if(size>0x904E6 && !memcmp(reinterpret_cast<void *>(address+0x904DA),agdcFind,sizeof(agdcFind))) {
+  KernelPatcher::LookupPatch patch {currentFramebuffer,agdcFind,agdcRepl,sizeof(agdcFind),1};
+  patcher.applyLookupPatch(&patch,reinterpret_cast<uint8_t *>(address+0x904DA),sizeof(agdcFind)+1);
+  agdc=patcher.getError()==KernelPatcher::Error::NoError &&
+   !memcmp(reinterpret_cast<void *>(address+0x904DA),agdcRepl,sizeof(agdcRepl));
+  patcher.clearError();
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXPanelAGDCOnlineIgnored",agdc);
+ const char *setAttrSym="__ZN21AppleIntelFramebuffer25setAttributeForConnectionEijm";
+ const uint8_t setAttrEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18};
+ const auto sa=patcher.solveSymbol<mach_vm_address_t>(index,setAttrSym,address,size);patcher.clearError();
+ bool backlight=false;
+ if(sa==address+0x352D4 && !memcmp(reinterpret_cast<void *>(sa),setAttrEntry,sizeof(setAttrEntry))) {
+  KernelPatcher::RouteRequest setRoute[]={{setAttrSym,wrapPanelSetAttr,orgPanelSetAttr}};
+  backlight=patcher.routeMultipleShort(index,setRoute,arrsize(setRoute),address,size);patcher.clearError();
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXPanelBacklightReady",backlight);
+ return ok;
+}
+
 uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_t length) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
  IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
  if(!ready)return kIOReturnNotReady;
  const auto r=FunctionCast(wrapDisplay13ReadAUX,callbackXE->orgDisplay13ReadAUX)(port,address,data,length);
  IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
+ // -wex-adlp-edp: an eDP 1.4 panel trained through LINK_RATE_SET (0x115)
+ // need not report a valid LINK_BW_SET (0x100); this OLED returns 0x01.
+ // AGDP derives link bandwidth from 0x100 and then rejects every mode.
+ // Report the rate the adopted link actually runs at (HBR here).
+ // Train the firmware-proven 4 x HBR configuration: cap MAX_LINK_RATE.
+ // DPCD 1.4 sinks repeat the receiver capabilities at 0x2200 (0x00E bit 7).
+ static const uint32_t capRates[]={0x001U,0x2201U};
+ for(uint32_t at:capRates)
+  if(!r && complete && callbackXE->display13PanelDP && data && length && address<=at && address+length>at &&
+     Display13FBMemory::field<uint32_t>(port,0x120)==0) {
+   auto &max=static_cast<uint8_t *>(data)[at-address];
+   if(max>0x0A){display13PanelTrace(29,at,max,0x0A);max=0x0A;}
+  }
+ if(!r && complete && callbackXE->display13PanelDP && data && length && address<=0x100 && address+length>0x100 &&
+    Display13FBMemory::field<uint32_t>(port,0x120)==0) {
+  auto &bw=static_cast<uint8_t *>(data)[0x100-address];
+  if(bw!=0x06 && bw!=0x0A && bw!=0x14 && bw!=0x1E) {
+   const auto rate=Display13FBMemory::field<uint32_t>(port,0x128);
+   const uint8_t actual=rate==6?0x06:rate==10?0x0A:rate==20?0x14:rate==30?0x1E:0x0A;
+   display13PanelTrace(26,address,length,bw,actual,rate);
+   bw=actual;
+  }
+ }
  return r ? r : complete ? 0 : kIOReturnNotReady;
+}
+// -wex-adlp-edp: eDP 1.4 rate-table sinks select the link rate through
+// LINK_RATE_SET (0x115); firmware leaves it set, so a LINK_BW_SET-only
+// retrain leaves source and sink at different rates. Like Linux, write
+// LINK_BW_SET=0 and the matching LINK_RATE_SET index from the sink table.
+static int display13PanelRateIndex(void *port,uint8_t code,uint32_t (*read)(void *,uint32_t,void *,uint32_t)) {
+ static uint16_t table[8];static bool loaded;
+ if(!loaded) {
+  uint8_t raw[16] {};
+  if(read(port,0x010,raw,sizeof(raw)))return -1;
+  for(unsigned i=0;i<8;++i)table[i]=uint16_t(raw[2*i]|(raw[2*i+1]<<8));
+  loaded=true;
+ }
+ // DPCD rate-table units are 200 kHz; LINK_BW_SET codes are 0.27 Gbps.
+ const uint32_t wanted=uint32_t(code)*1350;
+ for(unsigned i=0;i<8 && table[i];++i)if(table[i]==wanted)return int(i);
+ return -1;
 }
 uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32_t length) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
  IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
  if(!ready)return kIOReturnNotReady;
+ auto s=callbackXE;
+ if(s->display13PanelDP && data && length && length<=16 && address<=0x100 && address+length>0x100 &&
+    Display13FBMemory::field<uint32_t>(port,0x120)==0) {
+  const auto code=static_cast<const uint8_t *>(data)[0x100-address];
+  const auto index=code==0x06||code==0x0A||code==0x14||code==0x1E ?
+   display13PanelRateIndex(port,code,reinterpret_cast<uint32_t (*)(void *,uint32_t,void *,uint32_t)>(s->orgDisplay13ReadAUX)) : -1;
+  if(index>=0) {
+   uint8_t copy[16];memcpy(copy,data,length);copy[0x100-address]=0;
+   auto r=FunctionCast(wrapDisplay13WriteAUX,s->orgDisplay13WriteAUX)(port,address,copy,length);
+   uint8_t select=uint8_t(index);
+   if(!r)r=FunctionCast(wrapDisplay13WriteAUX,s->orgDisplay13WriteAUX)(port,0x115,&select,1);
+   display13PanelTrace(28,code,index,r,length>1 && address<=0x101 ? static_cast<const uint8_t *>(data)[0x101-address] : 0xFF);
+   IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
+   return r ? r : complete ? 0 : kIOReturnNotReady;
+  }
+ }
  const auto r=FunctionCast(wrapDisplay13WriteAUX,callbackXE->orgDisplay13WriteAUX)(port,address,data,length);
  IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
  return r ? r : complete ? 0 : kIOReturnNotReady;
@@ -7388,8 +7863,9 @@ uint32_t XE::wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,ui
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
  IOLockLock(c.lock);const bool ready=display13AUXReady(port,true);
  const auto ddi=ready ? Display13FBMemory::field<uint32_t>(port,0x120) : 7;
- IOLockUnlock(c.lock);if(!ready)return kIOReturnNotReady;
+ IOLockUnlock(c.lock);if(!ready){if(callbackXE->display13PanelDP)display13AUXFailRecord(port,UINT32_MAX,command);return kIOReturnNotReady;}
  const auto r=FunctionCast(wrapDisplay13RunAUX,callbackXE->orgDisplay13RunAUX)(port,command,packet,length,flag);
+ if(r && callbackXE->display13PanelDP)display13AUXFailRecord(port,r,command);
  IOLockLock(c.lock);Display13FBPowerIO io {c.map};const bool held=c.bridge.endAUXCommand(io,ddi);
  // HPD/assignment can disappear while the donor waits for the AUX reply.
  // Reject that reply, but only lost identity/power/leases poison the owner.
@@ -7437,7 +7913,7 @@ bool XE::processFramebufferTraining(KernelPatcher &patcher,size_t index,mach_vm_
 bool XE::processDisplay13Training(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  if(!adlnOutputWiring.links())return true;
  using namespace FramebufferTrainingNative;
- if(!framebufferTrainingHooksReady || (adlnOutputWiring.dp && !display13FBDPHooksReady) ||
+ if(!framebufferTrainingHooksReady || ((adlnOutputWiring.dp&0x78) && !display13FBDPHooksReady) ||
     (adlnOutputWiring.panel && (!display13PanelPowerReady || !tglSinkFramingReady)) || !display13FBSSTHooksReady ||
     !display13FBPowerReferencesReady || !orgDisplay13GMBusWrite)return false;
  const auto &e=entries[PortTrain];
@@ -7620,7 +8096,7 @@ bool XE::processDisplay13FramebufferSST(KernelPatcher &patcher,size_t index,mach
 
 // Called with the display owner lock held. The native caller owns the port;
 // require its retained platform record and BAR association before sampling it.
-uint8_t *XE::display13SSTPort(void *port) {
+uint8_t *XE::display13SSTPort(void *port,bool unprobed) {
  auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
  if(!s->display13FramebufferRequested || s->xeProfile.display!=XELP::Display::XeLPD || !s->display13FBSSTHooksReady ||
     !object || object->getMetaClass()->getClassSize()<0x624 || !c.controller ||
@@ -7629,7 +8105,11 @@ uint8_t *XE::display13SSTPort(void *port) {
  auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
  if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring) ||
     !(s->adlnOutputWiring.links()&(1U<<config[0])) || p[0x117] ||
-    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U) ||
+    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] ||
+    // Boot adoption runs before the first probePortMode; a Combo port is then
+    // still mode 0. Every AUX/training user requires the probed mode.
+    (Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U) &&
+     !(unprobed && config[0]<3 && !Display13FBMemory::field<uint32_t>(p,0x550))) ||
     Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
  return p;
 }
@@ -7670,7 +8150,7 @@ bool XE::display13MainLinkAUX(void *port,bool acquire,bool stopping) {
 }
 
 uint32_t XE::wrapDisplay13EnablePort(void *port) {
- auto s=callbackXE;
+ auto s=callbackXE;display13PanelTrace(6,Display13FBMemory::field<uint32_t>(port,0x120),0,display13LinkState());
  if(!s->adlnOutputWiring.links() || display13HDMIPort(port))
   return FunctionCast(wrapDisplay13EnablePort,s->orgDisplay13EnablePort)(port);
  if(!display13MainLinkAUX(port,true))return kIOReturnNotReady;
@@ -7680,7 +8160,7 @@ uint32_t XE::wrapDisplay13EnablePort(void *port) {
 }
 
 uint32_t XE::wrapDisplay13DisablePort(void *port) {
- auto s=callbackXE;
+ auto s=callbackXE;display13PanelTrace(7,Display13FBMemory::field<uint32_t>(port,0x120),0,display13LinkState());
  if(!s->adlnOutputWiring.links() || display13HDMIPort(port))
   return FunctionCast(wrapDisplay13DisablePort,s->orgDisplay13DisablePort)(port);
  if(!display13MainLinkAUX(port,true,true))return kIOReturnNotReady;
@@ -7718,7 +8198,7 @@ uint32_t XE::wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphas
 }
 
 uint32_t XE::wrapDisplay13TrainingPattern(void *path,uint32_t pattern) {
- auto s=callbackXE;auto &c=display13FBPower;
+ auto s=callbackXE;auto &c=display13FBPower;display13PanelTrace(8,pattern,0,display13LinkState());
  if(!s->adlnOutputWiring.links())return FunctionCast(wrapDisplay13TrainingPattern,s->orgDisplay13TrainingPattern)(path,pattern);
  auto object=static_cast<OSObject *>(path);
  if(!c.lock || !object || object->getMetaClass()->getClassSize()<0x3730)return kIOReturnNotReady;
@@ -8028,6 +8508,16 @@ void XE::wrapAlderLakeNGamma10(void *path,void *transaction,uint32_t control) {
 
 void XE::wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value) {
     if(display13DeferClock(access,reg,value,reinterpret_cast<uintptr_t>(__builtin_return_address(0))))return;
+    // -wex-adlp-edp: the panel is driven as a fixed DP sink, so nothing may
+    // power it down through PPS 0. Record donor PPS/AUX-well writes.
+    if(callbackXE->display13PanelDP && (reg==0xC7204 || reg==0x45444 || reg==0x45440 || reg==0x45404 || reg==0x45504)) {
+        const uint32_t original=value;
+        if(reg==0xC7204 && !(value&1))value|=0x7; // keep power-on, reset and backlight enable
+        // No DMC program is loaded (-disablegfxfirmware): DC3CO/DC5/DC6 would
+        // power-gate the display engine, including AUX, once pipes go idle.
+        if(reg==0x45504)value&=~((1U<<30)|3U);
+        display13PanelWriteRecord(reg,original,value,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    }
     // DISPLAY13_COMBO_FRACTION: qualified nominal writer, physical reference,
     // retained controller/manager. No MMIO or other port's PLL inference.
     if(callbackXE->display13FramebufferRequested && callbackXE->xeProfile.display==XELP::Display::XeLPD &&
@@ -8293,10 +8783,23 @@ uint32_t XE::wrapDisplay13FBEnable(IOService *fb) {
     r[5]=result;adlnFrontendSnapshot(fb,r);adlnPublishFrontend("Enable","Last",r);return result;
 }
 uint32_t XE::wrapAlderLakeNConnectionAttr(IOService *fb,int connection,uint32_t attribute,unsigned long *value) {
+    // -wex-adlp-edp: FB0 is the AUX-brightness OLED; the donor only answers
+    // 'bklt' for a native internal (PWM) panel. Report {value,min,max}.
+    if(callbackXE->display13PanelDP && attribute=='bklt' && !connection && value && fb &&
+       fb->getMetaClass()->getClassSize()>=0x4B90 && !Display13FBMemory::field<uint32_t>(fb,0x1DC)) {
+        value[0]=callbackXE->panelBrightness;value[1]=0;value[2]=0xFFFF;return kIOReturnSuccess;
+    }
     uint64_t r[16] {1,2,0,static_cast<uint32_t>(connection),attribute};
     adlnFrontendSnapshot(fb,r);adlnPublishFrontend("Attr","Entry",r);
     const auto result=FunctionCast(wrapAlderLakeNConnectionAttr,callbackXE->orgAlderLakeNConnectionAttr)(fb,connection,attribute,value);
+    // -wex-adlp-edp: the panel rides a DP connector record, so native reports
+    // external flags. Mark FB0 built-in (kIOConnectionBuiltIn) like LVDS/eDP.
+    if(callbackXE->display13PanelDP && attribute=='flgs' && !result && value && !connection && fb &&
+       fb->getMetaClass()->getClassSize()>=0x1E0 && !Display13FBMemory::field<uint32_t>(fb,0x1DC))*value|=0x800;
     r[5]=result;r[6]=!result && value ? *value : 0;adlnFrontendSnapshot(fb,r);adlnPublishFrontend("Attr","Last",r);
+    if(attribute=='enab' || attribute=='cena' || attribute=='chng' || attribute=='flgs')
+        display13PanelTrace(1,r[2],attribute,result,r[6],display13FBState(fb));
+    if(callbackXE->display13PanelDP && r[2]==0){display13ReplayVBL();display13PanelLiveState();}
     if(attribute=='cena' || attribute=='enab' || attribute=='flgs') {
         char key[64];snprintf(key,sizeof(key),"N97FBAttr%u_%08x",static_cast<uint32_t>(r[2]),attribute);
         IORegistryEntry::getRegistryRoot()->setProperty(key,r,sizeof(r));
@@ -8314,6 +8817,7 @@ uint32_t XE::wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,b
     uint64_t r[8] {1,block,force,0,0,config ? config[0] : 9};
     auto root=IORegistryEntry::getRegistryRoot();if(selected)root->setProperty("N97FBPortDDCEntry",r,sizeof(r));
     const auto result=FunctionCast(wrapAlderLakeNPortDDC,callbackXE->orgAlderLakeNPortDDC)(port,block,data,force);r[3]=result;
+    if(selected)display13PanelTrace(11,block,result,config?config[0]:9,display13LinkState());
     cachePanelDepth(port,block,data,result);
     if(selected) {
         if(!result && data && (block==1 || block==2)) {
@@ -8368,7 +8872,7 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	if(s->tglObservationController==that)s->tglObservationController=nullptr;
 	if(!pci)return false;
     const auto board=s->display13BoardWiring(provider);
-    if(!Display13FBTopology::supportedWiring(board,s->xeProfile.display==XELP::Display::XeLPD,checkKernelArgument("-wex-dsi-adopt")) ||
+    if(!Display13FBTopology::supportedWiring(board,s->xeProfile.display==XELP::Display::XeLPD,checkKernelArgument("-wex-dsi-adopt"),s->display13ComboDP()) ||
        board.selected()!=s->adlnOutputWiring.selected())return false;
     if(board.dsi) {
         const bool disposal=s->dsiFreePlane && s->dsiFreeScaler && s->dsiDetachPath && s->dsiRemovePath && s->dsiPipeMap;
@@ -8445,6 +8949,59 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	return accepted;
 }
 
+
+void XE::display13SSTPortRecord(void *port) {
+ auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
+ uint64_t r[12] {1};uint64_t &f=r[1];
+ if(!s->display13FramebufferRequested)f|=1;
+ if(s->xeProfile.display!=XELP::Display::XeLPD)f|=2;
+ if(!s->display13FBSSTHooksReady)f|=4;
+ if(!object || object->getMetaClass()->getClassSize()<0x624)f|=8;
+ if(!c.controller || c.controller!=s->adlnTopologyController)f|=0x10;
+ if(!adlnWriterMappingBound())f|=0x20;
+ if(c.clockFaulted)f|=0x40;
+ if(c.memoryFaulted)f|=0x80;
+ if(c.clockStopped)f|=0x100;
+ if(!s->adlnOutputWiring.described())f|=0x200;
+ if(!(f&8)) {
+  auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
+  if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring))f|=0x400;
+  if(config && !(s->adlnOutputWiring.dp&(1U<<config[0])))f|=0x800;
+  if(p[0x117])f|=0x1000;
+  if(config && Display13FBMemory::field<uint32_t>(p,0x120)!=config[0])f|=0x2000;
+  if(config && Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?4U:1U))f|=0x4000;
+  if(Display13FBMemory::field<void *>(p,0x578)!=c.access)f|=0x8000;
+  r[2]=config?config[0]:UINT64_MAX;r[3]=p[0x117];r[4]=Display13FBMemory::field<uint32_t>(p,0x120);
+  r[5]=Display13FBMemory::field<uint32_t>(p,0x550);r[6]=Display13FBMemory::field<uint32_t>(p,0x554);
+  r[7]=p[0x115];r[8]=Display13FBMemory::field<uint32_t>(p,0x124);r[9]=Display13FBMemory::field<uint32_t>(p,0x128);
+  if(config){r[10]=(uint64_t(config[1])<<32)|config[2];r[11]=(uint64_t(config[4])<<32)|config[5];}
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SSTPortReject",r,sizeof(r));
+}
+template<class IO> static void display13ComboAdoptRecord(void *port,IO &io,const AlderLakeN::DisplayReadout &boot,unsigned ddi) {
+ auto &c=display13FBPower;auto &b=c.bridge;auto &link=c.mainLink[ddi];
+ uint64_t r[10] {1};uint64_t &f=r[1];
+ if(!port)f|=1;
+ if(boot.activePipes!=1)f|=2;
+ if(!AlderLakeN::dpSource(boot,0,ddi))f|=4;
+ if(!AlderLakeN::dpSourceUnchanged(io,boot,0,ddi))f|=8;
+ if(b.bootPort!=ddi)f|=0x10;
+ if(b.bootAdopted)f|=0x20;
+ if(!b.bootPGProtected)f|=0x40;
+ if(!b.bootDDIProtected)f|=0x80;
+ if(!b.outputHeld(io,ddi,0))f|=0x100;
+ if(!b.pipeHeld(io,0))f|=0x200;
+ if(!b.ddiHeld(io,ddi))f|=0x400;
+ if(!link.bootPending)f|=0x800;
+ if(link.owner)f|=0x1000;
+ if(link.port!=ddi)f|=0x2000;
+ if(link.lease.owner!=&b.state)f|=0x4000;
+ if(link.lease.domains!=Display13Power::dependencies(Display13Power::auxDomain(ddi)))f|=0x8000;
+ if(!Display13Power::held(io,b.state,link.lease.domains))f|=0x10000;
+ r[2]=boot.activePipes;r[3]=boot.poweredPipes;r[4]=static_cast<uint32_t>(boot.status);
+ r[5]=link.port;r[6]=link.lease.domains;r[7]=io.read(Display13Power::AUX);r[8]=io.read(0x45404);r[9]=io.read(0x45454);
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13ComboAdopt",r,sizeof(r));
+}
 
 void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop) {
 	FunctionCast(wrapAlderLakeNSetupWorkLoop,callbackXE->orgAlderLakeNSetupWorkLoop)(controller,workLoop);
@@ -8557,7 +9114,9 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                 const auto ddi=c.bridge.bootPort;
                 const bool dp=ddi<7 && (callbackXE->adlnOutputWiring.links()&(1U<<ddi));
                 bool linked=!dp;
-                if(dp && display13SSTPort(port)) {
+                const bool comboBoot=ddi<2;
+                if(dp && !display13SSTPort(port,comboBoot))display13SSTPortRecord(port);
+                if(dp && display13SSTPort(port,comboBoot)) {
                     Display13FBBootIO io{c.map};auto &boot=c.displayScratch;AlderLakeN::readDisplay(io,true,boot);
                     if(ddi>=3) {
                         const auto source=Display13TC::Boot::capture(io,true,ddi,0);
@@ -8565,6 +9124,7 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                         linked=tc.owned(ddi) && tc.linkHeld() && boot.activePipes==1 &&
                             AlderLakeN::dpSourceUnchanged(io,boot,0,ddi,0,&source);
                     } else if(ddi<2) {
+                        display13ComboAdoptRecord(port,io,boot,ddi);
                         result=AlderLakeN::adoptDPBootAUX(io,boot,c.bridge,c.mainLink[ddi],reinterpret_cast<uintptr_t>(port),ddi,(callbackXE->adlnOutputWiring.panel&(1U<<ddi))!=0);
                         linked=result.status==Display13Power::Status::Complete;
                         if(linked)port->retain(); // Released only after real buffer stop/idle.
@@ -8580,6 +9140,7 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
 		c.pipe[0].memory=r;
 	}
 	if(result.status!=Display13Power::Status::Complete)adlnFault(c.bridge.state.faulted,__LINE__);
+	display13PanelTrace(30,static_cast<uint32_t>(result.status),c.bridge.bootAdopted,display13LinkState());
 	display13FBPowerRecord(record,7,0,result);
 	IOLockUnlock(c.lock);
 	if(result.status!=Display13Power::Status::Complete && adlnIRQOwner(controller))wrapDisplay13FBDisableIRQ(controller);
@@ -9044,7 +9605,13 @@ IOMemoryDescriptor *XE::wrapAlderLakeNAperture(IOService *fb,int apertureIndex) 
 		auto f=reinterpret_cast<uint8_t *>(fb);
 		base=Display13FBMemory::field<uint32_t>(fb,0x4330);bytes=Display13FBMemory::field<uint32_t>(fb,0x4314);
 		parent=OSDynamicCast(IOMemoryDescriptor,*reinterpret_cast<OSObject **>(static_cast<uint8_t *>(c.controller)+0xC80));
-		if(Display13FBMemory::field<uintptr_t>(fb,0x4348)) {
+		// -wex-adlp-edp boot adoption puts the FB online before native
+		// scanout allocation; an empty range is not-ready, not a fault.
+		if(Display13FBMemory::field<uintptr_t>(fb,0x4348) || (callbackXE->display13PanelDP && !bytes)) {
+			if(!bytes) {
+				uint64_t record[] {2,f[0x1E0],Display13FBMemory::field<uint8_t>(fb,0x4288),base,bytes};
+				adlnPublishMemory("N97FBApertureNotReady",pipe,record,sizeof(record),true);
+			}
 			IOLockUnlock(c.lock);return nullptr;
 		}
 		const auto slot=Display13FBMemory::allocatedSlot(c.controller,fb);
@@ -9063,7 +9630,7 @@ IOMemoryDescriptor *XE::wrapAlderLakeNAperture(IOService *fb,int apertureIndex) 
 			IOLockUnlock(c.lock);return nullptr;
 		}
 		if(!parent || !backing ||
-			!Display13FBMemory::apertureRange(c.pipe[pipe].memory.pool,base,bytes,parent->getLength()))parent=nullptr;
+			!Display13FBMemory::apertureRange(c.pipe[pipe].memory.pool,base,(bytes+4095)&~4095U,parent->getLength()))parent=nullptr;
 		if(parent)parent->retain();else {
 			uint64_t record[] {1,f[0x1E0],Display13FBMemory::field<uint8_t>(fb,0x4288),Display13FBMemory::field<uint32_t>(c.controller,0xDF0),base,bytes,
 				backing,c.pipe[pipe].memory.pool.state,c.pipe[pipe].memory.pool.pages};
@@ -9442,7 +10009,11 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
 		const auto ctl=Display13FBMemory::field<uint32_t>(plane,0x100),ipc=powered ? io.read(0x45004) : UINT32_MAX;
 		const auto cursorMode=powered && cursor ? io.read(0x70080+bank) : 0;
 		const bool rgbSupported=Display13WM::supportedRGBControl(ctl);
-		const bool yTiled=!cursor && ((ctl>>10)&7)==4;
+		// -wex-adlp-edp: the pending control can still describe the adopted
+		// linear GOP while the native modeset scans out Y-tiled (YTiling is
+		// forced at controller start). Y-tiled levels (four-line minimum) are
+		// a conservative superset for a linear primary, never an underrun.
+		const bool yTiled=!cursor && (((ctl>>10)&7)==4 || (callbackXE->display13PanelDP && ((ctl>>10)&7)==0));
 		const uint32_t width=cursor ? Display13FBMemory::field<uint32_t>(fb,0x4278) : (Display13FBMemory::field<uint32_t>(plane,0x11C)&0x1FFF)+1;
 		const auto htotal=(Display13FBMemory::field<uint16_t>(path,0x13A)&0x3FFF)+1;
 		inputs[14]=wells;inputs[15]=rangeRaw;inputs[16]=ctl;inputs[17]=ipc;inputs[18]=cursorMode;
@@ -9509,6 +10080,16 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
 void XE::wrapAlderLakeNPlaneWMSetup(OSObject *plane,OSObject *path) {adlnWMSetup(plane,path,false);}
 void XE::wrapDisplay13CursorWMSetup(OSObject *plane,OSObject *path) {adlnWMSetup(plane,path,true);}
 
+// -wex-adlp-edp: WM_LINETIME and the frame period follow the pipe's own pixel
+// clock (native base at path+0x118, doubled per fb+0x425c), not the rate that
+// adjustPixelClockForWatermarks raises by the pipe-scaler downscale ratio (i915).
+static uint64_t display13LineTimePixel(bool panel,IOService *fb,OSObject *path,uint64_t adjusted) {
+	if(!panel || !fb || !path || fb->getMetaClass()->getClassSize()<0x4B90 ||
+	   path->getMetaClass()->getClassSize()<0x3730)return adjusted;
+	auto base=Display13FBMemory::field<uint64_t>(path,0x118);
+	if(Display13FBMemory::field<uint8_t>(fb,0x425c))base*=2;
+	return base && base<=adjusted ? base : adjusted;
+}
 void XE::wrapAlderLakeNPipeWMSetup(IOService *controller,IOService *fb,OSObject *path,void *params) {
 	auto &c=display13FBPower;if(!c.lock)return;
 	uint64_t record[8] {};IOLockLock(c.lock);
@@ -9532,7 +10113,7 @@ void XE::wrapAlderLakeNPipeWMSetup(IOService *controller,IOService *fb,OSObject 
 		auto crtc=params ? params : reinterpret_cast<uint8_t *>(path)+0x128;
 		const auto htotal=((Display13FBMemory::field<uint32_t>(crtc,0x10)>>16)&0x3FFF)+1;
 		auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
-		const auto pixel=adjust(controller,fb,path,true,crtc);
+		const auto pixel=display13LineTimePixel(callbackXE->display13PanelDP,fb,path,adjust(controller,fb,path,true,crtc));
 		const auto value=Display13WM::pipeLineTime(htotal,pixel);
 		*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(crtc)+0x84)=value;
 		if(!value)adlnFault(c.watermarkFaulted,__LINE__);
@@ -9742,7 +10323,7 @@ Display13WM::Latch XE::adlnVerifyWMLatch(IOService *fb,uint64_t nativeHz,uint64_
 		void delayUs(unsigned us) {IOSleep(us/1000);}
 	} io {c.map};
 	auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
-	const auto pipePixel=adjust(c.controller,fb,path,true,nullptr);
+	const auto pipePixel=display13LineTimePixel(callbackXE->display13PanelDP,fb,path,adjust(c.controller,fb,path,true,nullptr));
     const auto primaryRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].primary);
     const auto cursorRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].cursor);
     if(primaryRaw==UINT32_MAX || cursorRaw==UINT32_MAX) {result.status=Display13WM::Status::Input;return result;}
@@ -10492,6 +11073,21 @@ void XE::wrapAlderLakeNPlanarDBUFWrite(void *access,uint64_t reg,uint32_t value)
 	uint64_t record[14] {2,reg,value};auto status=Display13DBUF::Status::Unavailable;
 	auto path=Display13FBMemory::singlePath<OSObject *>(fb);
 	auto plane=path && path->getMetaClass()->getClassSize()>=0x3730 ? Display13FBMemory::field<OSObject *>(path,0x32C8) : nullptr;
+	// -wex-adlp-edp: this donor helper also writes the initial RGB allocation,
+	// split a third/two thirds as for planar YUV. On the single panel pipe a
+	// pipe-scaled RGB mode (looks-like 1600x1000, a 3200-wide primary) keeps
+	// that third and underruns whenever memory is busy. Give the RGB primary
+	// the single-pipe layout that setupDBUF programs instead.
+	if(callbackXE->display13PanelDP && pipe==0 && plane && plane->getMetaClass()->getClassSize()>=0x1C8 &&
+	   !Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) &&
+	   Display13WM::supportedRGBControl(Display13FBMemory::field<uint32_t>(plane,0x100)) &&
+	   Display13FBMemory::field<uint32_t>(plane,0x10C)==value) {
+		const auto wanted=Display13DBUF::hardwareRaw(c.dbuf,pipe,{40,2048});
+		if(wanted && wanted!=value) {
+			record[2]=value|(uint64_t(wanted)<<32);
+			*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(plane)+0x10C)=wanted;value=wanted;
+		}
+	}
 	const auto binding=adlnInspectPathBinding(fb,path,callbackXE->adlnPlatform,callbackXE->adlnOutputWiring);
 	const bool associated=plane && binding.status==TGLFBBinding::Status::Complete && binding.pipe==pipe &&
 		Display13FBMemory::boundPipe(c.pipe,fb)==pipe && Display13FBMemory::field<void *>(plane,0x90)==access && access==c.access &&
@@ -11297,6 +11893,465 @@ bool XE::processAlderLakeNTaskBoundary(KernelPatcher &patcher, size_t index, mac
 	return ready;
 }
 
+// -wex-reset-trace: record the donor's GPU hang recovery. Each entry is
+// {mach time, event, result, object, arg, 16 registers}; events are enter/exit
+// pairs of the channel restart, engine reset, scheduler reset/resume and
+// command-streamer reset. The ring is memory-only and serialized on read, so
+// the recovery path never allocates.
+struct GPUResetTraceEntry {uint64_t time;uint32_t event,result;uint64_t object,arg;uint32_t regs[16];};
+static GPUResetTraceEntry gpuResetTraceRing[96];
+static volatile uint32_t gpuResetTraceCount;
+static volatile uint8_t *gpuResetMMIO;
+// GDRST, 4A08, RCS tail/head/start/ctl, IPEHR, INSTDONE, ACTHD, MI_MODE,
+// RESET_CTL, RING_MODE, EXECLIST_STATUS, CSB pointers, EXECLIST_CONTROL,
+// render forcewake ack.
+static const uint32_t gpuResetTraceRegs[16] {0x941C,0x4A08,0x2030,0x2034,0x2038,0x203C,0x2068,0x206C,
+ 0x2074,0x209C,0x20D0,0x229C,0x2234,0x23A0,0x2550,0x0D84};
+static mach_vm_address_t gpuResetOrgEngine,gpuResetOrgScheduler,gpuResetOrgResume;
+static bool gpuResetTraceOn;
+static void gpuResetTrace(uint32_t event,const void *object,uint64_t arg,uint64_t result) {
+ if(!__atomic_load_n(&gpuResetTraceOn,__ATOMIC_ACQUIRE))return;
+ // IGAccelFIFOChannel +0x18 is the accelerator, whose MMIO base is at +0x1240.
+ if(event==1 && object)if(auto owner=*reinterpret_cast<uint8_t *const *>(static_cast<const uint8_t *>(object)+0x18))
+  __atomic_store_n(&gpuResetMMIO,*reinterpret_cast<uint8_t **>(owner+0x1240),__ATOMIC_RELEASE);
+ const auto n=__sync_fetch_and_add(&gpuResetTraceCount,1);
+ auto &e=gpuResetTraceRing[n%arrsize(gpuResetTraceRing)];
+ e.time=mach_absolute_time();e.event=event;e.result=uint32_t(result);
+ e.object=reinterpret_cast<uint64_t>(object);e.arg=arg;
+ auto mmio=__atomic_load_n(&gpuResetMMIO,__ATOMIC_ACQUIRE);
+ for(unsigned i=0;i<arrsize(gpuResetTraceRegs);++i)
+  e.regs[i]=mmio?*reinterpret_cast<volatile uint32_t *>(mmio+gpuResetTraceRegs[i]):0;
+ // The unified log survives the forced restart that usually follows a failed
+ // recovery; the registry copy does not.
+ const auto &v=e.regs;
+ IOLog("WEXReset %u ev=%u res=%x obj=%llx arg=%llx gdrst=%x 4a08=%x tail=%x head=%x start=%x ctl=%x ipehr=%x "
+  "instdone=%x acthd=%x mimode=%x resetctl=%x mode=%x els=%x csb=%x elc=%x fwack=%x\n",n,event,e.result,e.object,arg,
+  v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11],v[12],v[13],v[14],v[15]);
+}
+static bool gpuResetTraceSerialize(void *,void *,OSSerialize *serializer) {
+ const auto n=__atomic_load_n(&gpuResetTraceCount,__ATOMIC_ACQUIRE);
+ const auto used=n<arrsize(gpuResetTraceRing)?n:uint32_t(arrsize(gpuResetTraceRing));
+ auto out=OSData::withCapacity(sizeof(uint32_t)+used*sizeof(GPUResetTraceEntry));if(!out)return false;
+ out->appendBytes(&n,sizeof(n));
+ // Oldest first, so the decoder reads events in order after a wrap.
+ for(uint32_t i=n-used;i<n;++i)out->appendBytes(&gpuResetTraceRing[i%arrsize(gpuResetTraceRing)],sizeof(GPUResetTraceEntry));
+ const bool result=out->serialize(serializer);out->release();return result;
+}
+// -wex-reset-restore: on this GPU the hung work sits on the donor's second
+// ring (0x1A000 block), whose reset uses the render GDRST domain (mask 2) but
+// whose restore list only names its own 0x1A000 registers. The render
+// engine's mode, status-page and chicken registers are therefore cleared and
+// never restored, so execlists stay off and every replay hangs again. Just
+// before a render-domain reset, wake the render domain and save those
+// registers (only from a healthy engine, execlists on); after the GDRST, with
+// the donor's forcewake still held, write them back before work is replayed.
+// Masked registers are rewritten with all enable bits; the rest raw.
+struct GPUResetRCSRegister {uint32_t reg;bool masked;};
+static const GPUResetRCSRegister gpuResetRCSRegisters[] {{0x229C,true},{0x2080,false},{0x209C,true},{0x20C0,true},
+ {0x2090,true},{0x7000,true},{0x7004,true},{0x20E0,true},{0x20E4,true},{0x20EC,true},{0x2580,true},
+ {0x7010,true},{0xE194,true},{0x20A0,false},{0x4090,false},{0x9430,false},{0x0D08,false},{0xB004,false},
+ // RC_PWRCTX_MAX, EMR and the user-mode register whitelist (FORCE_TO_NONPRIV
+ // 0..11): without it the donor's Metal/VA drivers lose their LRI targets.
+ {0x2054,false},{0x20B4,false},{0x24D0,false},{0x24D4,false},{0x24D8,false},{0x24DC,false},{0x24E0,false},
+ {0x24E4,false},{0x24E8,false},{0x24EC,false},{0x24F0,false},{0x24F4,false},{0x24F8,false},{0x24FC,false}};
+static bool gpuResetRestoreOn,gpuResetRCSValid;
+// The render-domain reset also clears the cache-control tables (global MOCS
+// 0x4000..0x40FC, L3 cache control 0xB020..0xB09C). Without them every GPU
+// access misses the L3 cache and work runs tens of times slower. Saved with
+// the render registers; after the reset, entries that changed are rewritten.
+struct GPUResetTable {uint32_t base,count;};
+static const GPUResetTable gpuResetTables[] {{0x4000,64},{0xB020,32}};
+static uint32_t gpuResetTableSaved[64+32];
+// Stamps whose work was lost in the reset never return, and IOAccel's
+// progress check then signals a restart for them every few seconds with no
+// channel to restart (the GPU work loop stalls each time). Two seconds after a
+// recovery, complete any stamp slot that is still behind its last issued value
+// and has not moved since: {returned +0, issued +8} in 64-byte slots at the
+// ring's +0x30, 64 slots. This fails the lost work instead of waiting forever.
+static uint8_t *volatile gpuResetStampBase;
+static uint32_t gpuResetStampSeen[64];
+static thread_call_t gpuResetStampCall;
+static volatile uint32_t gpuResetStampForced;
+static void gpuResetTrace(uint32_t event,const void *object,uint64_t arg,uint64_t result);
+static void gpuResetStampSweep(thread_call_param_t,thread_call_param_t) {
+ auto base=__atomic_load_n(&gpuResetStampBase,__ATOMIC_ACQUIRE);
+ if(!base)return;
+ uint64_t mask=0;uint32_t forced=0;
+ for(unsigned i=0;i<arrsize(gpuResetStampSeen);++i) {
+  auto slot=reinterpret_cast<volatile uint32_t *>(base+i*64);
+  const uint32_t done=slot[0],issued=slot[2];
+  if(int32_t(issued-done)>0 && done==gpuResetStampSeen[i]) {slot[0]=issued;mask|=1ULL<<i;++forced;}
+ }
+ __atomic_fetch_add(&gpuResetStampForced,forced,__ATOMIC_RELAXED);
+ gpuResetTrace(14,base,mask,forced);
+}
+static void gpuResetStampArm() {
+ auto base=__atomic_load_n(&gpuResetStampBase,__ATOMIC_ACQUIRE);
+ if(!base || !gpuResetStampCall)return;
+ for(unsigned i=0;i<arrsize(gpuResetStampSeen);++i)
+  gpuResetStampSeen[i]=*reinterpret_cast<volatile uint32_t *>(base+i*64);
+ uint64_t deadline;clock_interval_to_deadline(2,kSecondScale,&deadline);
+ thread_call_enter_delayed(gpuResetStampCall,deadline);
+}
+// A waiter that times out on a stamp lost in an earlier reset (for example a
+// command queue being torn down) otherwise waits forever: the engine is idle,
+// not hung, so IOAccel's eventTimeout never restarts anything, and the waiter
+// holds locks WindowServer needs. After a recovery this boot, complete a stamp
+// that is still behind its last issued value and has not moved across three
+// consecutive timeouts on it.
+static volatile uint32_t gpuResetSnapshots,gpuResetRestores;
+static mach_vm_address_t gpuResetOrgEventTimeout;
+static uint32_t gpuResetTimeoutSeen[64];
+static uint8_t gpuResetTimeoutStrikes[64];
+static uint64_t gpuResetEventTimeout(void *machine,int index) {
+ auto base=__atomic_load_n(&gpuResetStampBase,__ATOMIC_ACQUIRE);
+ if(base && index>=0 && index<int(arrsize(gpuResetTimeoutSeen)) &&
+    __atomic_load_n(&gpuResetRestores,__ATOMIC_ACQUIRE)) {
+  auto slot=reinterpret_cast<volatile uint32_t *>(base+index*64);
+  const uint32_t done=slot[0],issued=slot[2];
+  if(int32_t(issued-done)<=0) gpuResetTimeoutStrikes[index]=0;
+  else if(done!=gpuResetTimeoutSeen[index] || !gpuResetTimeoutStrikes[index]) {
+   gpuResetTimeoutSeen[index]=done;gpuResetTimeoutStrikes[index]=1;
+  } else if(++gpuResetTimeoutStrikes[index]>=3) {
+   slot[0]=issued;gpuResetTimeoutStrikes[index]=0;
+   __atomic_fetch_add(&gpuResetStampForced,1,__ATOMIC_RELAXED);
+   gpuResetTrace(15,machine,uint64_t(uint32_t(index))|(uint64_t(done)<<32),issued);
+  }
+ }
+ return FunctionCast(gpuResetEventTimeout,gpuResetOrgEventTimeout)(machine,index);
+}
+// Before/after copies of the donor hang report's register set, for diffing a
+// recovered engine against its pre-reset state (both taken with forcewake).
+static const uint32_t gpuResetDumpRegs[] {
+ // Global MOCS, slice/cache chicken, power gating, L3 cache control (LNCF
+ // MOCS) and half-slice ranges, to see state outside the hang report set.
+ 0x4000,0x4004,0x4008,0x400C,0x4010,0x4014,0x4018,0x401C,0x4020,0x4024,0x4028,0x402C,
+ 0x4034,0x4038,0x403C,0x4048,0x404C,0x4054,0x4058,0x405C,0x4060,0x4064,0x4068,0x406C,
+ 0x4070,0x4074,0x4078,0x407C,0x4080,0x4084,0x4088,0x408C,0x4094,0x4098,0x409C,0x40A0,
+ 0x40A4,0x40A8,0x40AC,0x40B0,0x40B4,0x40B8,0x40BC,0x40C0,0x40C4,0x40C8,0x40CC,0x40D0,
+ 0x40D4,0x40D8,0x40DC,0x40E0,0x40E4,0x40E8,0x40EC,0x40F0,0x40F4,0x40F8,0x40FC,0x700C,
+ 0x7018,0x701C,0x7024,0x7028,0x702C,0x7030,0x7034,0x7038,0x703C,0x7040,0x7044,0x7048,
+ 0x704C,0x7050,0x7054,0x7058,0x705C,0x7060,0x7064,0x7068,0x706C,0x7070,0x7074,0x7078,
+ 0x707C,0x7080,0x7084,0x7088,0x708C,0x7090,0x7094,0x7098,0x709C,0x70A0,0x70A4,0x70A8,
+ 0x70AC,0x70B0,0x70B4,0x70B8,0x70BC,0x70C0,0x70C4,0x70C8,0x70CC,0x70D0,0x70D4,0x70D8,
+ 0x70DC,0x70E0,0x70E4,0x70E8,0x70EC,0x70F0,0x70F4,0x70F8,0x70FC,0x9428,0x942C,0x9430,
+ 0x9434,0x9438,0x943C,0x9440,0x9444,0x9448,0x944C,0x9450,0x9454,0x9458,0x945C,0x9460,
+ 0x9464,0x9468,0x946C,0x9470,0x9474,0x9478,0x947C,0xA200,0xA204,0xA208,0xA20C,0xA210,
+ 0xA214,0xA218,0xA21C,0xA220,0xA224,0xA228,0xA22C,0xA230,0xA234,0xA238,0xA23C,0xA240,
+ 0xA244,0xA248,0xA24C,0xA250,0xA254,0xA258,0xA25C,0xA260,0xA264,0xA268,0xA26C,0xA270,
+ 0xA274,0xA278,0xA27C,0xA280,0xA284,0xA288,0xA28C,0xA290,0xA294,0xA298,0xA29C,0xA2A0,
+ 0xA2A4,0xA2A8,0xA2AC,0xA2B0,0xA2B4,0xA2B8,0xA2BC,0xA2C0,0xA2C4,0xA2C8,0xA2CC,0xA2D0,
+ 0xA2D4,0xA2D8,0xA2DC,0xA2E0,0xA2E4,0xA2E8,0xA2EC,0xA2F0,0xA2F4,0xA2F8,0xA2FC,0xB000,
+ 0xB004,0xB008,0xB00C,0xB010,0xB014,0xB018,0xB01C,0xB020,0xB024,0xB028,0xB02C,0xB030,
+ 0xB034,0xB038,0xB03C,0xB040,0xB044,0xB048,0xB04C,0xB050,0xB054,0xB058,0xB05C,0xB060,
+ 0xB064,0xB068,0xB06C,0xB070,0xB074,0xB078,0xB07C,0xB080,0xB084,0xB088,0xB08C,0xB090,
+ 0xB094,0xB098,0xB09C,0xB0A0,0xB0A4,0xB0A8,0xB0AC,0xB0B0,0xB0B4,0xB0B8,0xB0BC,0xB0C0,
+ 0xB0C4,0xB0C8,0xB0CC,0xB0D0,0xB0D4,0xB0D8,0xB0DC,0xB0E0,0xB0E4,0xB0E8,0xB0EC,0xB0F0,
+ 0xB0F4,0xB0F8,0xB0FC,0xB100,0xB104,0xB108,0xB10C,0xB110,0xB114,0xB118,0xB11C,0xB120,
+ 0xB124,0xB128,0xB12C,0xB130,0xB134,0xB138,0xB13C,0xB140,0xB144,0xB148,0xB14C,0xB150,
+ 0xB154,0xB158,0xB15C,0xB160,0xB164,0xB168,0xB16C,0xB170,0xB174,0xB178,0xB17C,0xB180,
+ 0xB184,0xB188,0xB18C,0xB190,0xB194,0xB198,0xB19C,0xB1A0,0xB1A4,0xB1A8,0xB1AC,0xB1B0,
+ 0xB1B4,0xB1B8,0xB1BC,0xB1C0,0xB1C4,0xB1C8,0xB1CC,0xB1D0,0xB1D4,0xB1D8,0xB1DC,0xB1E0,
+ 0xB1E4,0xB1E8,0xB1EC,0xB1F0,0xB1F4,0xB1F8,0xB1FC,0xE000,0xE004,0xE008,0xE00C,0xE010,
+ 0xE014,0xE018,0xE01C,0xE020,0xE024,0xE028,0xE02C,0xE030,0xE034,0xE038,0xE03C,0xE040,
+ 0xE044,0xE048,0xE04C,0xE050,0xE054,0xE058,0xE05C,0xE060,0xE064,0xE068,0xE06C,0xE070,
+ 0xE074,0xE078,0xE07C,0xE080,0xE084,0xE088,0xE08C,0xE090,0xE094,0xE098,0xE09C,0xE0A0,
+ 0xE0A4,0xE0A8,0xE0AC,0xE0B0,0xE0B4,0xE0B8,0xE0BC,0xE0C0,0xE0C4,0xE0C8,0xE0CC,0xE0D0,
+ 0xE0D4,0xE0D8,0xE0DC,0xE0E0,0xE0E4,0xE0E8,0xE0EC,0xE0F0,0xE0F4,0xE0F8,0xE0FC,0xE100,
+ 0xE104,0xE108,0xE10C,0xE110,0xE114,0xE118,0xE11C,0xE120,0xE124,0xE128,0xE12C,0xE130,
+ 0xE134,0xE138,0xE13C,0xE140,0xE144,0xE148,0xE14C,0xE150,0xE154,0xE158,0xE15C,0xE160,
+ 0xE164,0xE168,0xE16C,0xE170,0xE174,0xE178,0xE17C,0xE180,0xE184,0xE188,0xE18C,0xE190,
+ 0xE194,0xE198,0xE19C,0xE1A0,0xE1A4,0xE1A8,0xE1AC,0xE1B0,0xE1B4,0xE1B8,0xE1BC,0xE1C0,
+ 0xE1C4,0xE1C8,0xE1CC,0xE1D0,0xE1D4,0xE1D8,0xE1DC,0xE1E0,0xE1E4,0xE1E8,0xE1EC,0xE1F0,
+ 0xE1F4,0xE1F8,0xE1FC,0xE400,0xE414,0xE418,0xE41C,0xE420,0xE424,0xE42C,0xE430,0xE434,
+ 0xE438,0xE43C,0xE440,0xE444,0xE448,0xE44C,0xE450,0xE454,0xE458,0xE45C,0xE460,0xE464,
+ 0xE468,0xE46C,0xE470,0xE474,0xE478,0xE47C,0xE480,0xE484,0xE488,0xE48C,0xE490,0xE494,
+ 0xE498,0xE49C,0xE4A0,0xE4A4,0xE4A8,0xE4AC,0xE4B8,0xE4BC,0xE4C0,0xE4C4,0xE4C8,0xE4CC,
+ 0xE4D0,0xE4D4,0xE4D8,0xE4DC,0xE4E0,0xE4E4,0xE4E8,0xE4EC,0xE4F0,0xE4F4,0xE4F8,0xE4FC,
+ 0xE500,0xE504,0xE508,0xE50C,0xE510,0xE514,0xE518,0xE51C,0xE520,0xE524,0xE528,0xE52C,
+ 0xE530,0xE534,0xE538,0xE53C,0xE540,0xE544,0xE548,0xE54C,0xE550,0xE554,0xE558,0xE55C,
+ 0xE560,0xE564,0xE568,0xE56C,0xE570,0xE574,0xE578,0xE57C,0xE580,0xE584,0xE588,0xE58C,
+ 0xE590,0xE594,0xE598,0xE59C,0xE5A0,0xE5A4,0xE5A8,0xE5AC,0xE5B0,0xE5B4,0xE5B8,0xE5BC,
+ 0xE5C0,0xE5C4,0xE5C8,0xE5CC,0xE5D0,0xE5D4,0xE5D8,0xE5DC,0xE5E0,0xE5E4,0xE5E8,0xE5EC,
+ 0xE5F0,0xE5F4,0xE5F8,0xE5FC,
+ // GT frequency (RPS) and RC6 control, PM interrupt enable/mask.
+ 0xA008,0xA00C,0xA010,0xA01C,0xA024,0xA02C,0xA030,0xA068,0xA06C,0xA070,0xA090,0xA094,0xA168,0x19003C,0x190040,
+ 0x2028,0x2030,0x2034,0x2038,0x203C,0x2050,0x2054,0x2068,0x206C,0x2070,0x2074,0x2078,
+ 0x207C,0x2084,0x208C,0x2090,0x2094,0x2098,0x209C,0x20B0,0x20B4,0x20B8,0x20C0,0x20C4,
+ 0x20D0,0x20E0,0x20E4,0x2110,0x2134,0x2140,0x2148,0x2168,0x2178,0x217C,0x2180,0x2190,
+ 0x21A0,0x21A4,0x21B0,0x21D0,0x2200,0x2204,0x2208,0x220C,0x2210,0x222C,0x2234,0x223C,
+ 0x2244,0x2248,0x2250,0x2260,0x2270,0x2274,0x2278,0x227C,0x2280,0x2284,0x2288,0x228C,
+ 0x229C,0x22E0,0x2360,0x2364,0x2368,0x2370,0x2374,0x2378,0x237C,0x2380,0x2384,0x2388,
+ 0x238C,0x2390,0x2394,0x2398,0x239C,0x23A0,0x23A4,0x23A8,0x23AC,0x23B0,0x2400,0x2408,
+ 0x2410,0x2418,0x2420,0x2430,0x2434,0x2438,0x243C,0x2440,0x2450,0x2470,0x24D0,0x24D4,
+ 0x24D8,0x24DC,0x24E0,0x24EC,0x24F0,0x24F4,0x24F8,0x24FC,0x27F0,0x4030,0x4040,0x4044,
+ 0x4050,0x4090,0x4204,0x4510,0x4580,0x4700,0x4704,0x4708,0x470C,0x4780,0x4784,0x4788,
+ 0x478C,0x4790,0x4794,0x4798,0x479C,0x7000,0x7004,0x7008,0x7010,0x7014,0x7020,0x7100,
+ 0x8000,0x9030,0x9034,0x9070,0x91B8,0x91BC,0x91C0,0x91C4,0x91C8,0x91CC,0x9400,0x9404,
+ 0x9408,0x940C,0x9410,0x9414,0x9418,0x941C,0x9420,0x9424,0x9870,0x9874,0x9878,0xCEC4,
+ 0xE404,0xE408,0xE40C,0xE410,0xE428,0xE4B0,0xE4B4,0x12400,0x12404,0x12408,0x1240C,0x12410,
+ 0x12414,0x12418,0x1241C,0x12420,0x12424,0x12428,0x1242C,0x12430,0x12434,0x12438,0x1243C,0x12440,
+ 0x12444,0x14040,0x14050,0x14090,0x140A0,0x14700,0x14704,0x14708,0x1470C,0x14780,0x14784,0x14788,
+ 0x1478C,0x14790,0x14794,0x14798,0x1479C,0x18030,0x18034,0x18038,0x1803C,0x1806C,0x22028,0x22030,
+ 0x22034,0x22038,0x2203C,0x22050,0x22054,0x22064,0x22068,0x2206C,0x22074,0x22078,0x22080,0x22094,
+ 0x22098,0x2209C,0x220A0,0x220B0,0x220B4,0x220B8,0x220C0,0x220D0,0x22134,0x22140,0x22190,0x22198,
+ 0x221D0,0x22200,0x22270,0x22274,0x22278,0x2227C,0x22280,0x22284,0x22288,0x2228C,0x2229C,0x22358,
+ 0x24000,0x24094,0x24700,0x24708,0x24780,0x24784,0x24788,0x2478C,0x72204,0x731AC,0x73204,0x190030,
+ 0x190038,0x190090,0x1900A0,0x1900E8,0x1C0030,0x1C0034,0x1C0038,0x1C003C,0x1C0050,0x1C0054,0x1C0064,0x1C0068,
+ 0x1C006C,0x1C0074,0x1C0078,0x1C0080,0x1C0094,0x1C0098,0x1C009C,0x1C00A0,0x1C00A8,0x1C00B0,0x1C00B4,0x1C00B8,
+ 0x1C00C0,0x1C00D0,0x1C0110,0x1C0114,0x1C0140,0x1C0178,0x1C017C,0x1C0190,0x1C0198,0x1C01D0,0x1C0270,0x1C0274,
+ 0x1C0278,0x1C027C,0x1C0280,0x1C0284,0x1C0288,0x1C028C,0x1C0358};
+static uint32_t gpuResetDump[2][arrsize(gpuResetDumpRegs)];
+static volatile uint32_t gpuResetDumpCount[2];
+static void (*gpuResetForceWake)(void *,bool,unsigned);
+static uint32_t gpuResetRCSSaved[arrsize(gpuResetRCSRegisters)];
+static void gpuResetDumpTake(uint8_t *mmio,unsigned which) {
+ for(unsigned i=0;i<arrsize(gpuResetDumpRegs);++i)
+  gpuResetDump[which][i]=*reinterpret_cast<volatile uint32_t *>(mmio+gpuResetDumpRegs[i]);
+ __atomic_fetch_add(&gpuResetDumpCount[which],1,__ATOMIC_RELEASE);
+}
+// Called after a whole recovery returns: wake, copy, release.
+static void gpuResetDumpAfter(void *channel) {
+ if(!__atomic_load_n(&gpuResetRestoreOn,__ATOMIC_ACQUIRE) || !gpuResetForceWake || !channel)return;
+ auto accel=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(channel)+0x18);
+ auto mmio=accel?*reinterpret_cast<uint8_t **>(accel+0x1240):nullptr;
+ if(!mmio)return;
+ gpuResetForceWake(accel,true,7);gpuResetDumpTake(mmio,1);gpuResetForceWake(accel,false,7);
+ gpuResetStampArm();
+}
+static uint32_t gpuResetSaveRCS(uint8_t *accel) {
+ auto mmio=*reinterpret_cast<uint8_t **>(accel+0x1240);
+ if(!mmio || !gpuResetForceWake)return 0;
+ gpuResetForceWake(accel,true,7);
+ uint32_t values[arrsize(gpuResetRCSRegisters)];
+ for(unsigned i=0;i<arrsize(values);++i)values[i]=*reinterpret_cast<volatile uint32_t *>(mmio+gpuResetRCSRegisters[i].reg);
+ if(values[0]&8)gpuResetDumpTake(mmio,0);
+ uint32_t tables[arrsize(gpuResetTableSaved)];
+ for(unsigned t=0,k=0;t<arrsize(gpuResetTables);++t)
+  for(uint32_t i=0;i<gpuResetTables[t].count;++i,++k)
+   tables[k]=*reinterpret_cast<volatile uint32_t *>(mmio+gpuResetTables[t].base+i*4);
+ gpuResetForceWake(accel,false,7);
+ // RING_MODE bit 3 (legacy ring disabled = execlists) marks a healthy engine;
+ // keep the last healthy copy across back-to-back failed recoveries.
+ if(values[0]!=UINT32_MAX && (values[0]&8) && values[1]) {
+  memcpy(gpuResetRCSSaved,values,sizeof(values));
+  memcpy(gpuResetTableSaved,tables,sizeof(tables));
+  __atomic_store_n(&gpuResetRCSValid,true,__ATOMIC_RELEASE);
+  __atomic_fetch_add(&gpuResetSnapshots,1,__ATOMIC_RELAXED);
+ }
+ return values[0];
+}
+static uint32_t gpuResetRestoreRCS(void *scheduler) {
+ auto accel=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(scheduler)+0x10);
+ if(!accel || !__atomic_load_n(&gpuResetRCSValid,__ATOMIC_ACQUIRE))return 0;
+ auto mmio=*reinterpret_cast<uint8_t **>(accel+0x1240);
+ if(!mmio)return 0;
+ for(unsigned i=0;i<arrsize(gpuResetRCSRegisters);++i) {
+  const auto value=gpuResetRCSSaved[i];
+  *reinterpret_cast<volatile uint32_t *>(mmio+gpuResetRCSRegisters[i].reg)=
+   gpuResetRCSRegisters[i].masked?0xFFFF0000|(value&0xFFFF):value;
+ }
+ uint32_t rewritten=0;
+ for(unsigned t=0,k=0;t<arrsize(gpuResetTables);++t)
+  for(uint32_t i=0;i<gpuResetTables[t].count;++i,++k) {
+   auto reg=reinterpret_cast<volatile uint32_t *>(mmio+gpuResetTables[t].base+i*4);
+   if(*reg!=gpuResetTableSaved[k]) {*reg=gpuResetTableSaved[k];++rewritten;}
+  }
+ __atomic_fetch_add(&gpuResetRestores,1,__ATOMIC_RELAXED);
+ // RING_MODE in the low half, cache-table entries rewritten in the high half.
+ return (*reinterpret_cast<volatile uint32_t *>(mmio+0x229C)&0xFFFF)|(rewritten<<16);
+}
+static bool gpuResetDumpSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t head[3] {uint32_t(arrsize(gpuResetDumpRegs)),__atomic_load_n(&gpuResetDumpCount[0],__ATOMIC_ACQUIRE),
+  __atomic_load_n(&gpuResetDumpCount[1],__ATOMIC_ACQUIRE)};
+ auto out=OSData::withCapacity(sizeof(head)+sizeof(gpuResetDumpRegs)+sizeof(gpuResetDump));if(!out)return false;
+ out->appendBytes(head,sizeof(head));out->appendBytes(gpuResetDumpRegs,sizeof(gpuResetDumpRegs));
+ out->appendBytes(gpuResetDump,sizeof(gpuResetDump));
+ const bool result=out->serialize(serializer);out->release();return result;
+}
+static bool gpuResetDefaultsSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t data[3+2*arrsize(gpuResetRCSRegisters)] {};
+ data[0]=__atomic_load_n(&gpuResetRestores,__ATOMIC_ACQUIRE);
+ data[1]=__atomic_load_n(&gpuResetSnapshots,__ATOMIC_ACQUIRE);
+ data[2]=__atomic_load_n(&gpuResetRCSValid,__ATOMIC_ACQUIRE);
+ for(unsigned i=0;i<arrsize(gpuResetRCSRegisters);++i) {
+  data[3+i*2]=gpuResetRCSRegisters[i].reg|(gpuResetRCSRegisters[i].masked?0x80000000U:0);data[4+i*2]=gpuResetRCSSaved[i];
+ }
+ auto out=OSData::withBytes(data,sizeof(data));if(!out)return false;
+ const bool result=out->serialize(serializer);out->release();return result;
+}
+static uint64_t gpuResetEngine(void *ring,void *context) {
+ // IGHardwareRingBuffer: +0x10 accelerator (MMIO at +0x1240), +0x40 engine
+ // index, +0x8B8 per-engine state with reset flags at +0xA4.
+ auto accel=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(ring)+0x10);
+ if(accel)__atomic_store_n(&gpuResetMMIO,*reinterpret_cast<uint8_t **>(accel+0x1240),__ATOMIC_RELEASE);
+ const auto engine=*(static_cast<uint8_t *>(ring)+0x40);
+ if(auto stamps=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(ring)+0x30))
+  __atomic_store_n(&gpuResetStampBase,stamps,__ATOMIC_RELEASE);
+ auto state=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(ring)+0x8B8+engine*8);
+ const uint64_t arg=engine|(uint64_t(state?*reinterpret_cast<uint32_t *>(state+0xA4):UINT32_MAX)<<32);
+ // Event 12: the ring's own reset MMIO base (+0x50) relative to the
+ // accelerator's, its GDRST mask (+0x70) and restore-list length.
+ if(accel) {
+  auto restore=*reinterpret_cast<uint64_t **>(static_cast<uint8_t *>(ring)+0x78);
+  gpuResetTrace(12,ring,*reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(ring)+0x50)-
+   *reinterpret_cast<uint64_t *>(accel+0x1240),
+   *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(ring)+0x70)|(uint64_t(restore?*restore:0)<<24));
+ }
+ gpuResetTrace(3,context,arg,0);
+ if(accel && __atomic_load_n(&gpuResetRestoreOn,__ATOMIC_ACQUIRE) &&
+    (*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(ring)+0x70)&2))
+  gpuResetTrace(13,context,arg,gpuResetSaveRCS(accel));
+ auto r=FunctionCast(gpuResetEngine,gpuResetOrgEngine)(ring,context);
+ gpuResetTrace(4,context,arg,r&0xFF);return r;
+}
+static uint64_t gpuResetScheduler(void *scheduler,uint32_t type,void *context) {
+ gpuResetTrace(5,context,type,0);
+ if(__atomic_load_n(&gpuResetRestoreOn,__ATOMIC_ACQUIRE))
+  gpuResetTrace(11,context,type,gpuResetRestoreRCS(scheduler));
+ auto r=FunctionCast(gpuResetScheduler,gpuResetOrgScheduler)(scheduler,type,context);
+ gpuResetTrace(6,context,type,r);return r;
+}
+static uint64_t gpuResetResume(void *scheduler) {
+ gpuResetTrace(7,scheduler,0,0);
+ auto r=FunctionCast(gpuResetResume,gpuResetOrgResume)(scheduler);
+ gpuResetTrace(8,scheduler,0,r);return r;
+}
+// The channel restart and the command-streamer reset already have WhateverXe
+// routes (single-pass recovery, CSB12); their wrappers record events 1/2 and
+// 9/10, so only the donor functions nothing else routes are hooked here.
+static bool gpuResetTraceInstall(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ static const char *symbols[] {"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext",
+  "__ZN12IGScheduler515processGPUResetE10IGHwCsTypeP17IGHardwareContext","__ZN12IGScheduler56resumeEv"};
+ static const uintptr_t offsets[] {0x43576,0x380D8,0x3906C};
+ static const uint8_t engine[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x18,0x49};
+ static const uint8_t scheduler[] {0x55,0x48,0x89,0xE5,0x89,0xF0,0x48,0x8B,0xBC,0xC7,0xA0,0x0C,0,0,0x5D,0xE9,0xAA,0x22};
+ static const uint8_t resume[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0xC6,0x87,0x88,0x0A,0,0,0,0x4C};
+ static const uint8_t *heads[] {engine,scheduler,resume};
+ bool ready=size>0x43600;
+ for(unsigned i=0;i<arrsize(symbols) && ready;++i)
+  ready=patcher.solveSymbol<mach_vm_address_t>(index,symbols[i],address,size)==address+offsets[i] &&
+   !memcmp(reinterpret_cast<void *>(address+offsets[i]),heads[i],sizeof(engine));
+ patcher.clearError();
+ if(ready) {
+  KernelPatcher::RouteRequest routes[] {{symbols[0],gpuResetEngine,gpuResetOrgEngine},
+   {symbols[1],gpuResetScheduler,gpuResetOrgScheduler},{symbols[2],gpuResetResume,gpuResetOrgResume}};
+  ready=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
+  patcher.clearError();
+ }
+ __atomic_store_n(&gpuResetTraceOn,ready,__ATOMIC_RELEASE);
+ if(ready && checkKernelArgument("-wex-reset-restore")) {
+  static const uint8_t wake[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
+  auto at=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator13SafeForceWakeEbj",address,size);
+  patcher.clearError();
+  if(at==address+0x28C2A && !memcmp(reinterpret_cast<void *>(at),wake,sizeof(wake)))
+   gpuResetForceWake=reinterpret_cast<void (*)(void *,bool,unsigned)>(at);
+ }
+ const bool restore=ready && gpuResetForceWake;
+ if(restore && !gpuResetStampCall)gpuResetStampCall=thread_call_allocate(gpuResetStampSweep,nullptr);
+ if(restore) {
+  // IGAccelEventMachine::eventTimeout(int): exact donor entry, no other route.
+  static const uint8_t timeout[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x18};
+  const char *symbol="__ZN19IGAccelEventMachine12eventTimeoutEi";
+  bool timeoutReady=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size)==address+0x15F22 &&
+   !memcmp(reinterpret_cast<void *>(address+0x15F22),timeout,sizeof(timeout));
+  patcher.clearError();
+  if(timeoutReady) {
+   KernelPatcher::RouteRequest route {symbol,gpuResetEventTimeout,gpuResetOrgEventTimeout};
+   timeoutReady=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXGPUResetEventTimeoutReady",timeoutReady);
+ }
+ __atomic_store_n(&gpuResetRestoreOn,restore,__ATOMIC_RELEASE);
+ auto root=IORegistryEntry::getRegistryRoot();
+ root->setProperty("WEXGPUResetTraceReady",ready);
+ root->setProperty("WEXGPUResetRestoreReady",restore);
+ if(ready)if(auto live=OSSerializer::forTarget(nullptr,gpuResetTraceSerialize)) {
+  root->setProperty("WEXGPUResetTrace",live);live->release();
+ }
+ if(restore)if(auto live=OSSerializer::forTarget(nullptr,gpuResetDefaultsSerialize)) {
+  root->setProperty("WEXGPUResetDefaults",live);live->release();
+ }
+ if(restore)if(auto live=OSSerializer::forTarget(nullptr,gpuResetDumpSerialize)) {
+  root->setProperty("WEXGPUResetDump",live);live->release();
+ }
+ return ready;
+}
+
+// -wex-scanout-coherent: surfaceStateFillMemoryObjectControlState gives a
+// displayable IOSurface a MOCS that does not keep its writes in the LLC; the
+// display engine reads memory without snooping the LLC. WindowServer's
+// backing for a downscaled HiDPI mode (larger than the panel) is not marked
+// displayable but is still flipped to the plane, so the display showed
+// whatever the LLC had not written back yet. Treat a storage resource that
+// has been flipped as displayable.
+static void *(*scanoutGetStorage)(void *);
+static void *(*scanoutPlaneResource)(void *,uint32_t,uint32_t);
+static mach_vm_address_t scanoutOrgDisplayable,scanoutOrgTransaction;
+static void *scanoutRing[16];
+static volatile uint32_t scanoutNext;
+static volatile uint64_t scanoutUpgrades,scanoutTransactions;
+static void scanoutRecord(void *resource) {
+ if(!resource)return;
+ auto storage=scanoutGetStorage(resource);if(!storage)return;
+ for(auto entry:scanoutRing)if(__atomic_load_n(&entry,__ATOMIC_RELAXED)==storage)return;
+ const auto i=__atomic_fetch_add(&scanoutNext,1,__ATOMIC_RELAXED)%arrsize(scanoutRing);
+ __atomic_store_n(&scanoutRing[i],storage,__ATOMIC_RELEASE);
+}
+// WindowServer's flips arrive as IOAccelDisplayPipeTransaction2s.
+// validateTransaction reads planes 0 and 1, eye 0.
+static uint64_t scanoutPerformTransaction(void *pipe,void *transaction) {
+ __atomic_fetch_add(&scanoutTransactions,1,__ATOMIC_RELAXED);
+ if(transaction)for(uint32_t plane=0;plane<2;++plane)scanoutRecord(scanoutPlaneResource(transaction,plane,0));
+ return FunctionCast(scanoutPerformTransaction,scanoutOrgTransaction)(pipe,transaction);
+}
+// Replaces IGAccelResource::isDisplayableIOSurface entirely (storage+0x1CB bit 3);
+// its original starts with a relative call, so the trampoline is never used.
+static bool scanoutDisplayable(void *resource) {
+ auto storage=static_cast<uint8_t *>(scanoutGetStorage(resource));
+ if(storage[0x1CB]&8)return true;
+ for(unsigned i=0;i<arrsize(scanoutRing);++i)if(__atomic_load_n(&scanoutRing[i],__ATOMIC_ACQUIRE)==storage) {
+  __atomic_fetch_add(&scanoutUpgrades,1,__ATOMIC_RELAXED);return true;
+ }
+ return false;
+}
+static bool scanoutSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t r[] {2,__atomic_load_n(&scanoutUpgrades,__ATOMIC_RELAXED),
+  __atomic_load_n(&scanoutNext,__ATOMIC_RELAXED),__atomic_load_n(&scanoutTransactions,__ATOMIC_RELAXED)};
+ auto out=OSData::withBytes(r,sizeof(r));if(!out)return false;
+ const bool result=out->serialize(serializer);out->release();return result;
+}
+static bool scanoutCoherentInstall(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ static const uint8_t displayHead[] {0x55,0x48,0x89,0xE5,0xE8};
+ static const uint8_t displayTail[] {0x8A,0x80,0xCB,0x01,0,0,0x24,0x08,0xC0,0xE8,0x03,0x5D,0xC3};
+ static const uint8_t transactionHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xEC,0x58,0x01,0,0};
+ const char *display="__ZN15IGAccelResource22isDisplayableIOSurfaceEv";
+ const char *transaction="__ZN18IGAccelDisplayPipe18performTransactionEP30IOAccelDisplayPipeTransaction2";
+ bool ready=size>0x81100 &&
+  patcher.solveSymbol<mach_vm_address_t>(index,display,address,size)==address+0x751D6 &&
+  patcher.solveSymbol<mach_vm_address_t>(index,transaction,address,size)==address+0x80EF0;
+ patcher.clearError();
+ const auto at=reinterpret_cast<const uint8_t *>(address+0x751D6);
+ ready=ready && !memcmp(at,displayHead,sizeof(displayHead)) && !memcmp(at+9,displayTail,sizeof(displayTail)) &&
+  !memcmp(reinterpret_cast<const void *>(address+0x80EF0),transactionHead,sizeof(transactionHead)) &&
+  *reinterpret_cast<const uint8_t *>(address+0x8107E)==0xE8;
+ if(ready) {
+  int32_t rel;memcpy(&rel,at+5,sizeof(rel));
+  scanoutGetStorage=reinterpret_cast<void *(*)(void *)>(address+0x751D6+9+int64_t(rel));
+  // performTransaction's own getPlaneResource(plane,eye) call.
+  memcpy(&rel,reinterpret_cast<const uint8_t *>(address+0x8107F),sizeof(rel));
+  scanoutPlaneResource=reinterpret_cast<void *(*)(void *,uint32_t,uint32_t)>(address+0x81083+int64_t(rel));
+  KernelPatcher::RouteRequest routes[] {{display,scanoutDisplayable,scanoutOrgDisplayable},
+   {transaction,scanoutPerformTransaction,scanoutOrgTransaction}};
+  ready=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
+  patcher.clearError();
+ }
+ auto root=IORegistryEntry::getRegistryRoot();
+ root->setProperty("WEXScanoutCoherentReady",ready);
+ if(ready)if(auto live=OSSerializer::forTarget(nullptr,scanoutSerialize)) {root->setProperty("WEXScanoutCoherent",live);live->release();}
+ return ready;
+}
+
 bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
  if(adlnDetected && tglAcceleratorRequested)dsiBackingHooksReady=processDSIBackingHooks(patcher,index,address,size);
  // Framebuffer-only mode must never enter the donor accelerator probe.
@@ -11316,6 +12371,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  const bool surfaceABIReady=tglInstallSonomaSurfaceABI(patcher,index,address,size,false);
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
+ if(checkKernelArgument("-wex-reset-trace") || checkKernelArgument("-wex-reset-restore"))
+  gpuResetTraceInstall(patcher,index,address,size);
+ if(checkKernelArgument("-wex-scanout-coherent"))scanoutCoherentInstall(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.
    {
@@ -14075,6 +15133,9 @@ XELP::DisplayContract::Mask XE::display13Available() const {
  // Fixed TC DP supports cold training and an explicitly validated SST GOP.
  // Boot source, memory, Mode/AUX and native path adoption are all required.
  if(display13FBDPHooksReady && display13TCDPProbeReady)a|=C::DPBoot13;
+ // Combo-only fixed DP (-wex-adlp-edp): the Combo boot AUX hold/adopt path
+ // replaces Mode, so the provider's Combo DP capability is the probe proof.
+ if(display13ComboDPReady && display13DPProbeReady && !(adlnOutputWiring.dp&0x78))a|=C::DPBoot13;
  if(display13TrainingReady)a|=C::Training12;
  if(display13FramingReady)a|=C::Framing;
  if(!display13ClockOrderReady)a&=~C::ClockOrder;
@@ -14324,6 +15385,19 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	if (auto renderer = OSDynamicCast(OSNumber, that->getProperty("IOVARendererID"))) {
 		if (renderer->unsigned32BitValue() == 0x1080040)
 			that->setProperty("IOVARendererID", 0x1080080, 32);
+	}
+	// -wex-no-multicontext: the donor personality enables its second
+	// (multi-context compute) command streamer. Run compute on the render
+	// engine instead; populateAccelConfig reads this before engine setup.
+	if (checkKernelArgument("-wex-no-multicontext")) {
+		auto dev=OSDynamicCast(OSDictionary,that->getProperty("Development"));
+		auto copy=dev ? OSDictionary::withDictionary(dev) : nullptr;
+		auto zero=OSNumber::withNumber(0ULL,32);
+		const bool set=copy && zero && copy->setObject("EnableMultiContext",zero);
+		if (set) that->setProperty("Development",copy);
+		IORegistryEntry::getRegistryRoot()->setProperty("WEXMultiContextDisabled",set);
+		if (zero) zero->release();
+		if (copy) copy->release();
 	}
 
 	// Big Sur's HEVC decoder requires this registry admission key in addition
@@ -15206,8 +16280,10 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
 }
 void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
 void XE::wrapTGLCSBReset(void *streamer) {
+ gpuResetTrace(9,streamer,0,0);
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
+ gpuResetTrace(10,streamer,0,0);
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];

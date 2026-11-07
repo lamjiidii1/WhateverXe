@@ -145,6 +145,11 @@ private:
     XELP::SmallGTResources display12SmallGT;
     XELP::Profile xeProfile;
     XELP::VBT::Ports firmwarePorts;
+    // -wex-adlp-edp: experimental ADL-P/U internal panel on Combo A, driven
+    // through the fixed Combo DP SST backend. Off by default.
+    bool display13PanelDP {};
+    uint32_t display13ComboDP() const {return display13PanelDP ? 1U : 0U;}
+    bool display13ComboDPReady {};
     void xelpReadFirmware(IOPCIDevice *pci);
     void xelpLoadDisplayPool(IOService *provider);
     bool xelpInstallHostRPS(KernelPatcher &,size_t,mach_vm_address_t,size_t);
@@ -227,7 +232,28 @@ private:
  static bool display13StopTranscoder(void *port);
  static bool display13DeferClock(void *access,uint64_t reg,uint32_t value,uintptr_t caller);
 
- static uint8_t *display13SSTPort(void *port);
+ static uint8_t *display13SSTPort(void *port,bool unprobed=false);
+ static void display13SSTPortRecord(void *port);
+ static void display13PanelWriteRecord(uint32_t reg,uint32_t original,uint32_t value,uintptr_t caller);
+ static void display13AUXFailRecord(void *port,uint32_t result,uint32_t command);
+ // -wex-adlp-edp time-ordered display trace.
+ static void display13PanelTrace(uint32_t event,uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_t d=0,uint64_t e=0);
+ bool processDisplay13PanelTrace(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
+ mach_vm_address_t orgPanelConnectionChanged {},orgPanelGetOnlineInfo {},orgPanelConnectionProbe {};
+ static uint32_t wrapPanelConnectionProbe(IOService *fb);
+ mach_vm_address_t orgPanelCurrentMode {},orgPanelSetupTiming {},orgPanelInterruptState {};
+ static uint32_t wrapPanelInterruptState(void *controller,void *ref,uint32_t state,IOService *fb);
+ static void display13ReplayVBL();
+ mach_vm_address_t orgPanelValidateMode {},panelProgrammedMode {};
+ // -wex-adlp-edp backlight: VESA eDP DPCD brightness (0x720-0x723) behind 'bklt'.
+ mach_vm_address_t orgPanelSetAttr {};uint32_t panelBrightness {0x8000};bool panelBrightnessDPCD {};
+ static uint32_t wrapPanelSetAttr(IOService *fb,int connection,uint32_t attribute,uintptr_t value);
+ static uint32_t display13PanelSetBrightness(IOService *fb,uint32_t value);
+ static uint32_t wrapPanelValidateMode(IOService *fb,int mode,const void **desc,const void **timing);
+ static void wrapPanelSetupTiming(IOService *fb,const void *timing,void *out);
+ static uint32_t wrapPanelCurrentMode(IOService *fb,int *mode,int *depth);
+ static uint32_t wrapPanelConnectionChanged(IOService *fb);
+ static uint32_t wrapPanelGetOnlineInfo(IOService *fb,void *path,uint8_t *online,uint8_t *info);
  static bool display13HDMIPort(void *port);
  static uint32_t wrapDisplay13TrainingPattern(void *path,uint32_t pattern);
  static uint32_t wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig);

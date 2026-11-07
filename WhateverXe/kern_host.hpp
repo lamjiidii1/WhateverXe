@@ -30,6 +30,8 @@ private:
  mach_vm_address_t orgWSAAAttribute {};
  static IOReturn wrapWSAAAttribute(IOFramebuffer *,uint32_t,uint32_t);
  bool backlightEnabled {};
+ // -wex-adlp-edp: ADL-P AUX-brightness panel; profile key follows the PNLF UID.
+ bool backlightPanelEDP {};
  IOPCIDevice *backlightGPU {};
  mach_vm_address_t orgPanelSetDisplay {};
  static bool wrapPanelSetDisplay(IOService *,IOService *);
