@@ -1,0 +1,55 @@
+diff --git a/VoodooI2CHID/VoodooI2CMultitouchHIDEventDriver.cpp b/VoodooI2CHID/VoodooI2CMultitouchHIDEventDriver.cpp
+index 52b1076..3a2b385 100644
+--- a/VoodooI2CHID/VoodooI2CMultitouchHIDEventDriver.cpp
++++ b/VoodooI2CHID/VoodooI2CMultitouchHIDEventDriver.cpp
+@@ -535,6 +535,11 @@ IOReturn VoodooI2CMultitouchHIDEventDriver::parseDigitizerElement(IOHIDElement*
+ 
+                     if (sub_element->conformsTo(kHIDPage_Digitizer, kHIDUsage_Dig_DeviceMode))
+                         digitiser.input_mode = sub_element;
++                    // Function switch report (Windows PTP): surface switch 0x57, button switch 0x58
++                    else if (sub_element->getUsagePage() == kHIDPage_Digitizer && sub_element->getUsage() == 0x57)
++                        digitiser.surface_switch = sub_element;
++                    else if (sub_element->getUsagePage() == kHIDPage_Digitizer && sub_element->getUsage() == 0x58)
++                        digitiser.button_switch = sub_element;
+                 }
+             }
+         }
+diff --git a/VoodooI2CHID/VoodooI2CMultitouchHIDEventDriver.hpp b/VoodooI2CHID/VoodooI2CMultitouchHIDEventDriver.hpp
+index 60b9558..7b0133d 100644
+--- a/VoodooI2CHID/VoodooI2CMultitouchHIDEventDriver.hpp
++++ b/VoodooI2CHID/VoodooI2CMultitouchHIDEventDriver.hpp
+@@ -74,6 +74,8 @@ class EXPORT VoodooI2CMultitouchHIDEventDriver : public IOHIDEventService {
+         
+         IOHIDElement*      contact_count = NULL;
+         IOHIDElement*      input_mode = NULL;
++        IOHIDElement*      surface_switch = NULL;
++        IOHIDElement*      button_switch = NULL;
+         IOHIDElement*      primaryButton = NULL;
+         IOHIDElement*      secondaryButton = NULL;
+         
+diff --git a/VoodooI2CHID/VoodooI2CPrecisionTouchpadHIDEventDriver.cpp b/VoodooI2CHID/VoodooI2CPrecisionTouchpadHIDEventDriver.cpp
+index ddc5e7b..8d4e763 100644
+--- a/VoodooI2CHID/VoodooI2CPrecisionTouchpadHIDEventDriver.cpp
++++ b/VoodooI2CHID/VoodooI2CPrecisionTouchpadHIDEventDriver.cpp
+@@ -18,6 +18,21 @@ void VoodooI2CPrecisionTouchpadHIDEventDriver::enterPrecisionTouchpadMode() {
+     OSData *value = OSData::withBytes(inputMode, sizeof(inputMode));
+     digitiser.input_mode->setDataValue(value);
+     OSSafeReleaseNULL(value);
++
++    // Some touchpads (e.g. Samsung Galaxy Book3 IMG4100) power up with surface and button
++    // reporting off and stay silent in PTP mode until the host turns them on, like Windows and Linux do.
++    UInt8 on[] = { 1 };
++    if (digitiser.surface_switch) {
++        OSData *v = OSData::withBytes(on, sizeof(on));
++        digitiser.surface_switch->setDataValue(v);
++        OSSafeReleaseNULL(v);
++    }
++    if (digitiser.button_switch) {
++        OSData *v = OSData::withBytes(on, sizeof(on));
++        digitiser.button_switch->setDataValue(v);
++        OSSafeReleaseNULL(v);
++    }
++    IOLog("%s::%s Surface switch %s, button switch %s\n", getName(), name, digitiser.surface_switch ? "on" : "absent", digitiser.button_switch ? "on" : "absent");
+     ready = true;
+ }
+ 

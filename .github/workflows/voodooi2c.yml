@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - .github/workflows/voodooi2c.yml
+      - tools/hidprobe/voodooi2chid-ptp-switch.patch
   workflow_dispatch:
 
 env:
@@ -22,6 +23,12 @@ jobs:
         ref: 6be653a2d2234ac1f7464ebf12716314975c3920
         submodules: recursive
         fetch-depth: 500
+    - name: Checkout patches
+      uses: actions/checkout@v4
+      with:
+        path: wexpatches
+    - name: Apply PTP function switch patch
+      run: git -C "VoodooI2C Satellites/VoodooI2CHID" apply "$GITHUB_WORKSPACE/wexpatches/tools/hidprobe/voodooi2chid-ptp-switch.patch" && git -C "VoodooI2C Satellites/VoodooI2CHID" diff --stat
     - name: Checkout MacKernelSDK
       uses: actions/checkout@v4
       with:
@@ -39,5 +46,5 @@ jobs:
       run: xcodebuild -workspace VoodooI2C.xcworkspace -scheme VoodooI2C -derivedDataPath build -jobs 1 -configuration Debug
     - uses: actions/upload-artifact@v4
       with:
-        name: VoodooI2C-master-6be653a
+        name: VoodooI2C-ptpswitch
         path: build/Build/Products/*/*.zip
