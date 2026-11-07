@@ -588,6 +588,10 @@ int main() {
     {uint8_t caps[3]={0x14,0x1E,0x84};Display13EDPKeep::capLinkCaps(0,caps,3);assert(caps[1]==0x0A);
      uint8_t big[3]={0x14,0x1E,0x84};Display13EDPKeep::capLinkCaps(0,big,3,true);assert(big[1]==0x14 && big[2]==0x84);
      uint8_t bw[1]={0x1E};Display13EDPKeep::capLinkCaps(0x100,bw,1,true);assert(bw[0]==0x14);
+     // The machine's LINK_BW_SET/LANE_COUNT_SET as AGDP read them: 0x01 0x84.
+     uint8_t set[2]={0x01,0x84};Display13EDPKeep::capLinkCaps(0x100,set,2,true);assert(set[0]==0x14 && set[1]==0x84);
+     uint8_t keep[2]={0x01,0x84};Display13EDPKeep::capLinkCaps(0x100,keep,2);assert(keep[0]==0x01);
+     uint8_t hbr[1]={0x0A};Display13EDPKeep::capLinkCaps(0x100,hbr,1,true);assert(hbr[0]==0x0A);
      // 200 kHz units: 2.7G 13500 (0x34BC), 5.4G 27000 (0x6978), 8.1G 40500 (0x9E34)
      uint8_t rates[6]={0xBC,0x34,0x78,0x69,0x34,0x9E};Display13EDPKeep::capLinkCaps(0x10,rates,6,true);
      assert(rates[0]==0xBC && rates[2]==0x78 && !rates[4] && !rates[5]);}

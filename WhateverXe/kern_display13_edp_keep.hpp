@@ -86,6 +86,11 @@ inline void capLinkCaps(uint32_t address,uint8_t *data,uint32_t length,bool hbr2
  const auto at=[&](uint32_t reg)->uint8_t *{return reg>=address && reg-address<length ? data+(reg-address) : nullptr;};
  const uint32_t rates[]={0x001U,0x2201U,0x100U};
  for(const auto reg:rates)if(auto b=at(reg); b && *b>rateCap)*b=rateCap;
+ // A link trained through the eDP 1.4 rate table can leave LINK_BW_SET with a
+ // value that is no DP rate code (Galaxy Book3 Ultra: 0x01). The donor reuses
+ // it as the link rate ("Invalid bit rate 0x1"), finds no bandwidth and fails
+ // the link-modeset callback; report the capped rate instead.
+ if(auto b=at(0x100U); hbr2 && b && *b!=0x06 && *b!=0x0A && *b!=0x14 && *b!=0x1E)*b=rateCap;
  for(uint32_t i=0;i<8;++i) {
   auto lo=at(0x10+2*i),hi=at(0x11+2*i);
   if(lo && hi && uint32_t(*lo|(*hi<<8))>tableCap)*lo=*hi=0;
