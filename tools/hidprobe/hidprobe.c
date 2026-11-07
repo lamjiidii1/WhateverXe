@@ -1,6 +1,8 @@
 // hidprobe: print raw input reports of the internal I2C touchpad for N seconds
 #include <IOKit/hid/IOHIDManager.h>
 #include <IOKit/hid/IOHIDKeys.h>
+#include <IOKit/hidsystem/IOHIDLib.h>
+#include <string.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
 #include <stdlib.h>
