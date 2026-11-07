@@ -6075,6 +6075,18 @@ IOReturn XE::wrapDisplay13FBDisableIRQ(IOService *controller) {
 	controller->setProperty("N97FBIRQ",record,sizeof(record));
 	return disabled ? kIOReturnSuccess : kIOReturnNotReady;
 }
+// -wex-edp-dsc diagnostics: every VBL configuration the donor asks for, with
+// the pipe A interrupt registers and plane surface right after it. Static
+// storage published once as a no-copy OSData, so ioreg reads it live.
+static uint32_t display13VBLTrace[2+48*8];
+static void display13VBLTraceAdd(Display13FBIRQIO &io,uint32_t pipe,bool enabled,bool valid,bool getLock,uint32_t status,const Display13FBIRQ::State &st) {
+	if(!AlderLakeN::admitDSCPanel)return;
+	auto &t=display13VBLTrace;const uint32_t n=t[1];t[0]=1;t[1]=n+1;
+	auto e=t+2+8*(n<48?n:47);
+	e[0]=n+1;e[1]=(pipe&0xFF)|(enabled?0x100:0)|(valid?0x200:0)|(getLock?0x400:0);e[2]=status;
+	e[3]=(st.active&0xFF)|((st.configured&0xFF)<<8)|(st.faulted?0x10000:0)|(st.enabled?0x20000:0);
+	e[4]=static_cast<uint32_t>(st.vblanks[0]);e[5]=io.read(0x44404);e[6]=io.read(0x4440C);e[7]=io.read(0x7019C);
+}
 void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObject *path,bool enabled,bool getLock) {
 	if(!adlnIRQOwner(controller) || !fb || !path)return;
 	auto &c=display13FBIRQ;Display13FBIRQIO io {c.base};
@@ -6106,6 +6118,7 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 	}
 	else c.status=Display13FBIRQ::fail(io,c.state,Display13FBIRQ::Status::Topology);
 	adlnIRQCache(controller,io);
+	display13VBLTraceAdd(io,pipe,enabled,valid,getLock,static_cast<uint32_t>(c.status),c.state);
 	if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
 }
 bool XE::wrapDisplay13FBProcessIRQ(IOService *controller) {
@@ -7054,7 +7067,10 @@ static void display13DSCAfterMode() {
     IOLockLock(c.lock);
     Display13FBBootIO io{c.map};auto &live=c.displayScratch;AlderLakeN::readDisplay(io,true,live);
     auto root=IORegistryEntry::getRegistryRoot();
-    if(call==1)root->setProperty("WEXEDPDSCAfterModeFirst",&live,sizeof(live));
+    if(call==1) {
+        root->setProperty("WEXEDPDSCAfterModeFirst",&live,sizeof(live));
+        if(auto d=OSData::withBytesNoCopy(display13VBLTrace,sizeof(display13VBLTrace))) {root->setProperty("WEXVBLTrace",d);d->release();}
+    }
     root->setProperty("WEXEDPDSCAfterMode",&live,sizeof(live));
     root->setProperty("WEXEDPDSCAfterModeCall",call,32);
     IOLockUnlock(c.lock);
