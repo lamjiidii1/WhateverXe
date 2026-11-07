@@ -7044,6 +7044,21 @@ uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,c
     return result.status;
 }
 
+// -wex-edp-dsc diagnostics: the display registers right after each donor
+// mode set (plane, stride, surface, scaler, DSC, transcoder), the first and the
+// last one, to compare with the firmware's N97Display13Boot.
+static void display13DSCAfterMode() {
+    auto &c=display13FBPower;
+    if(!AlderLakeN::admitDSCPanel || !c.lock || !c.map)return;
+    static volatile uint32_t calls=0;const auto call=__sync_add_and_fetch(&calls,1);
+    IOLockLock(c.lock);
+    Display13FBBootIO io{c.map};auto &live=c.displayScratch;AlderLakeN::readDisplay(io,true,live);
+    auto root=IORegistryEntry::getRegistryRoot();
+    if(call==1)root->setProperty("WEXEDPDSCAfterModeFirst",&live,sizeof(live));
+    root->setProperty("WEXEDPDSCAfterMode",&live,sizeof(live));
+    root->setProperty("WEXEDPDSCAfterModeCall",call,32);
+    IOLockUnlock(c.lock);
+}
 uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing) {
     auto self=callbackXE;
     // The GOP-preserving surface adapter must replace this refusal before
@@ -7055,9 +7070,11 @@ uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing
             Display13FBMemory::singlePath<OSObject *>(service) : nullptr;
         if(dsiLifecycleTarget(service,path))return kIOReturnNotReady;
     }
-    return Display13TC::finishMode(
+    const auto result=Display13TC::finishMode(
         [&](){return FunctionCast(wrapDisplay13TCSetMode,self->orgDisplay13TCSetMode)(controller,fb,timing);},
         [&](){reinterpret_cast<void (*)(void *,void *,uint32_t)>(self->display13TCNotify)(controller,fb,1);});
+    display13DSCAfterMode();
+    return result;
 }
 
 bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {

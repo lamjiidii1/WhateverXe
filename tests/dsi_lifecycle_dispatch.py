@@ -36,6 +36,7 @@ constexpr uint32_t kIOReturnNotReady=0xe00002d8;
 uint32_t nativeMode(void*,void*,const void*){++modeCalls;return modeResult;}
 void nativeStop(IOService*,IOService*,OSObject*,uint8_t){++stopCalls;}
 void notify(void*,void*,uint32_t value){assert(value==1);++notifications;}
+static void display13DSCAfterMode(){}
 struct XE {
  struct Wiring{unsigned dsi=0;operator unsigned()const{return dsi;}}adlnOutputWiring;void *adlnPlatform=nullptr;
  uintptr_t orgDisplay13TCSetMode=reinterpret_cast<uintptr_t>(nativeMode),display13TCNotify=reinterpret_cast<uintptr_t>(notify);
