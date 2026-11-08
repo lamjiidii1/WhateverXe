@@ -7477,7 +7477,7 @@ struct Display13EDPAuxBLRecord {
  uint32_t stage,source,ddi,flags;
 };
 enum Display13EDPAuxBLStage : uint32_t {NoPort=1,TCON,CapsRead,StateRead,Unusable,Written,WriteFailed};
-static Display13EDPAuxBLRecord display13EDPAuxBLState {4};
+static Display13EDPAuxBLRecord display13EDPAuxBLState {5};
 static mach_vm_address_t display13EDPAuxBLPortByDDI=0;
 void XE::display13EDPAuxBLApply(uint32_t brightness) {
  namespace A=Display13EDPAuxBL;
@@ -7497,11 +7497,13 @@ void XE::display13EDPAuxBLApply(uint32_t brightness) {
  IOLockLock(display13EDPAuxBLLock);
  ++r.calls;r.brightness=brightness;r.source=source;r.ddi=ddi;r.stage=NoPort;
  bool handled=false;
- // A Camellia/TCON-routed builtin port (+0x548 flags 0x18) is not ours.
+ // Builtin ports (+0x548 flags 0x18) first offer writeAUX to the controller's
+ // TCON cache hook (+0x1540); without an Apple TCON (+0xD0 NULL, which
+ // display13AUXReady requires) that hook is _CheckCacheDummyCallback and
+ // returns 0, so the native AUX transaction follows unchanged.
  auto config=port ? Display13FBMemory::field<uint32_t *>(port,0x548) : nullptr;
  if(config)r.flags=config[5];
- if(config && (config[5]&0x18)==0x18)r.stage=TCON;
- if(config && (config[5]&0x18)!=0x18) {
+ if(config) {
   uint8_t caps[3] {},state[2] {};
   uint32_t e=wrapDisplay13ReadAUX(port,A::CapsAddress,caps,sizeof(caps));
   r.stage=CapsRead;
