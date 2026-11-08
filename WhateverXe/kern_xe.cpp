@@ -7486,7 +7486,7 @@ struct Display13EDPAuxBLRecord {
  uint32_t reqNext,writeNext,req[32],write[32];
 };
 enum Display13EDPAuxBLStage : uint32_t {NoPort=1,TCON,CapsRead,StateRead,Unusable,Written,WriteFailed};
-static Display13EDPAuxBLRecord display13EDPAuxBLState {8};
+static Display13EDPAuxBLRecord display13EDPAuxBLState {9};
 static mach_vm_address_t display13EDPAuxBLPortByDDI=0;
 static bool display13EDPAuxBLIntel() {
  static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-auxbl-intel") ? 1 : 0;
@@ -7587,11 +7587,17 @@ void XE::display13EDPAuxBLApply(uint32_t brightness) {
 // Requests are coalesced; only the latest level is written.
 static volatile uint64_t display13EDPAuxBLPending=0; // bit32 set = pending
 static thread_call_t display13EDPAuxBLCall=nullptr;
+static volatile uint64_t display13EDPAuxBLLastWrite=0;
 void XE::display13EDPAuxBLWork(thread_call_param_t,thread_call_param_t) {
- for(unsigned i=0;i<8;++i) {
-  const auto v=__atomic_exchange_n(&display13EDPAuxBLPending,0ULL,__ATOMIC_ACQ_REL);
-  if(!(v>>32))break;
-  display13EDPAuxBLApply(static_cast<uint32_t>(v));
+ const auto v=__atomic_exchange_n(&display13EDPAuxBLPending,0ULL,__ATOMIC_ACQ_REL);
+ if(!(v>>32))return;
+ const auto start=mach_absolute_time();
+ __atomic_store_n(&display13EDPAuxBLLastWrite,start,__ATOMIC_RELEASE);
+ display13EDPAuxBLApply(static_cast<uint32_t>(v));
+ // A request that arrived while this call ran must still land.
+ if(__atomic_load_n(&display13EDPAuxBLPending,__ATOMIC_ACQUIRE)>>32) {
+  uint64_t interval=0;nanoseconds_to_absolutetime(50000000ULL,&interval);
+  thread_call_enter_delayed(display13EDPAuxBLCall,start+interval);
  }
 }
 bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t &result) {
@@ -7606,7 +7612,19 @@ bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t
  // The panel ignores the PWM duty; never fall back to it (or to its power path).
  *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
  __atomic_store_n(&display13EDPAuxBLPending,(1ULL<<32)|brightness,__ATOMIC_RELEASE);
- thread_call_enter(display13EDPAuxBLCall);
+ // macOS ramps brightness at ~100 Hz and every AUX write wakes the panel
+ // link. Write at most every 50 ms (the latest level always lands), or with
+ // -wex-edp-auxbl-final only once the requests pause for 200 ms.
+ static int final=-1;if(final<0)final=checkKernelArgument("-wex-edp-auxbl-final") ? 1 : 0;
+ uint64_t now=mach_absolute_time(),interval=0;
+ nanoseconds_to_absolutetime(final ? 200000000ULL : 50000000ULL,&interval);
+ if(final)thread_call_enter_delayed(display13EDPAuxBLCall,now+interval);
+ else {
+  const auto last=__atomic_load_n(&display13EDPAuxBLLastWrite,__ATOMIC_ACQUIRE);
+  if(last && now-last<interval) {
+   if(!thread_call_isactive(display13EDPAuxBLCall))thread_call_enter_delayed(display13EDPAuxBLCall,last+interval);
+  } else thread_call_enter(display13EDPAuxBLCall);
+ }
  result=0;
  return true;
 }
