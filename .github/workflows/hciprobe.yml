@@ -1,0 +1,24 @@
+name: hciprobe
+
+on:
+  push:
+    paths:
+      - tools/hciprobe/**
+      - .github/workflows/hciprobe.yml
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: |
+        cd tools/hciprobe
+        clang -O2 -Wall -arch x86_64 -arch arm64 -mmacosx-version-min=12.0 -framework IOKit -framework CoreFoundation -o hciprobe hciprobe.c
+        codesign -s - -f hciprobe
+        file hciprobe
+    - uses: actions/upload-artifact@v4
+      with:
+        name: hciprobe
+        path: tools/hciprobe/hciprobe
