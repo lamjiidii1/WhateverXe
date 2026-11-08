@@ -16,6 +16,8 @@
 #include "kern_xelp_call_target.hpp"
 #include "kern_xelp_native_placement.hpp"
 #include <Headers/kern_disasm.hpp>
+#include <Headers/kern_mach.hpp>
+#include "kern_mtl_posh_fix.hpp"
 #include "kern_alderlake_n.hpp"
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
@@ -4351,7 +4353,43 @@ bool XE::xelpInstallHostRPS(KernelPatcher &patcher,size_t index,mach_vm_address_
     return ready;
 }
 
+// -wex-mtl-poshfix (MTLPoshFix): patch the TGL Metal donor's command buffer
+// dealloc when its page is validated on page-in, as Lilu's UserPatcher does.
+// The bundle lives on the data volume, so a boot-time file lookup cannot see it.
+static mach_vm_address_t mtlPoshOrgValidateRange {};
+static uint32_t mtlPoshReady {}, mtlPoshPages {}, mtlPoshWriteFailures {};
+static boolean_t mtlPoshValidateRange(void *blobs,void *pager,uint64_t offset,const void *data,uint64_t size,unsigned *tainted) {
+ const auto res=FunctionCast(mtlPoshValidateRange,mtlPoshOrgValidateRange)(blobs,pager,offset,data,size,tainted);
+ if(res)MTLPoshFix::forEachMatch(static_cast<const uint8_t *>(data),size,[](uint8_t *page) {
+  if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS) {
+   __atomic_fetch_add(&mtlPoshWriteFailures,1U,__ATOMIC_RELAXED);return;
+  }
+  const bool done=MTLPoshFix::apply(page);
+  MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
+  if(done)__atomic_fetch_add(&mtlPoshPages,1U,__ATOMIC_RELAXED);
+ });
+ return res;
+}
+static bool mtlPoshSerialize(void *,void *,OSSerialize *serializer) {
+ // version, route ready, patched page-ins, write-enable failures
+ const uint32_t q[4] {1,__atomic_load_n(&mtlPoshReady,__ATOMIC_RELAXED),
+  __atomic_load_n(&mtlPoshPages,__ATOMIC_RELAXED),__atomic_load_n(&mtlPoshWriteFailures,__ATOMIC_RELAXED)};
+ auto d=OSData::withBytes(q,sizeof(q));if(!d)return false;
+ const bool ok=d->serialize(serializer);d->release();return ok;
+}
+static void installMTLPoshFix(KernelPatcher &patcher) {
+ if(!checkKernelArgument("-wex-mtl-poshfix"))return;
+ KernelPatcher::RouteRequest route {"_cs_validate_range",mtlPoshValidateRange,mtlPoshOrgValidateRange};
+ const bool ready=patcher.routeMultipleLong(KernelPatcher::KernelID,&route,1) && mtlPoshOrgValidateRange;
+ patcher.clearError();
+ __atomic_store_n(&mtlPoshReady,ready ? 1U : 0U,__ATOMIC_RELAXED);
+ if(auto s=OSSerializer::forTarget(nullptr,mtlPoshSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXMTLPoshFix",s);s->release();
+ }
+}
+
 void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
+	installMTLPoshFix(patcher);
 	// This must precede tglLoadHDMIWiring, tglPrepareMMIOUC and TGL FIA reads.
 	auto physicalGPU = OSDynamicCast(IOPCIDevice, info->videoBuiltin);
 	selectProfile(XELP::deviceProfile(physicalGPU));
