@@ -35,6 +35,7 @@
 
 #include "kern_dvmt.hpp"
 #include <Headers/kern_patcher.hpp>
+#include <kern/thread_call.h>
 #include <Headers/kern_devinfo.hpp>
 #include <Headers/kern_cpu.hpp>
 #include <Headers/kern_disasm.hpp>
@@ -257,6 +258,8 @@ private:
     // -wex-edp-auxbl: VESA AUX brightness of a kept type-5 eDP panel (kern_display13_edp_auxbl).
     bool processDisplay13EDPAuxBL(KernelPatcher &,size_t,mach_vm_address_t,size_t);
     static bool display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t &result);
+    static void display13EDPAuxBLApply(uint32_t brightness);
+    static void display13EDPAuxBLWork(thread_call_param_t,thread_call_param_t);
     mach_vm_address_t orgDisplay13EDPPowerState {};
     static uint32_t wrapDisplay13EDPPowerState(IOService *,uint32_t);
     mach_vm_address_t orgDSITransaction[5] {};

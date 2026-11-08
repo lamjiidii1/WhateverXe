@@ -7477,12 +7477,10 @@ struct Display13EDPAuxBLRecord {
  uint32_t stage,source,ddi,flags;
 };
 enum Display13EDPAuxBLStage : uint32_t {NoPort=1,TCON,CapsRead,StateRead,Unusable,Written,WriteFailed};
-static Display13EDPAuxBLRecord display13EDPAuxBLState {3};
+static Display13EDPAuxBLRecord display13EDPAuxBLState {4};
 static mach_vm_address_t display13EDPAuxBLPortByDDI=0;
-bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t &result) {
+void XE::display13EDPAuxBLApply(uint32_t brightness) {
  namespace A=Display13EDPAuxBL;
- if(!display13EDPAuxBLRequested() || !controller)return false;
- if(!display13EDPAuxBLLock)return false;
  auto port=__atomic_load_n(&display13EDPAuxBLPort,__ATOMIC_ACQUIRE);
  auto &r=display13EDPAuxBLState;
  uint32_t source=port ? 1 : 0,ddi=UINT32_MAX;
@@ -7524,14 +7522,30 @@ bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t
   if(handled && e){++r.failures;r.stage=WriteFailed;}
   else if(handled){++r.written;r.stage=Written;}
  } else ++r.declined;
- if(handled)*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
  const auto copy=r;
  IOLockUnlock(display13EDPAuxBLLock);
  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPAuxBL",const_cast<Display13EDPAuxBLRecord *>(&copy),sizeof(copy));
- // A failed AUX write still owns the request: the PWM duty would not reach
- // this panel either, and a retry follows with the next slider step.
- result=handled && copy.result ? uint32_t(kIOReturnNotResponding) : 0;
- return handled;
+}
+// The AUX transactions run on a thread call, never in the caller of
+// hwSetBacklight: WindowServer's brightness request must not wait on the panel.
+// Requests are coalesced; only the latest level is written.
+static volatile uint64_t display13EDPAuxBLPending=0; // bit32 set = pending
+static thread_call_t display13EDPAuxBLCall=nullptr;
+void XE::display13EDPAuxBLWork(thread_call_param_t,thread_call_param_t) {
+ for(unsigned i=0;i<8;++i) {
+  const auto v=__atomic_exchange_n(&display13EDPAuxBLPending,0ULL,__ATOMIC_ACQ_REL);
+  if(!(v>>32))break;
+  display13EDPAuxBLApply(static_cast<uint32_t>(v));
+ }
+}
+bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t &result) {
+ if(!display13EDPAuxBLRequested() || !controller || !display13EDPAuxBLLock || !display13EDPAuxBLCall)return false;
+ // The panel ignores the PWM duty; never fall back to it (or to its power path).
+ *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
+ __atomic_store_n(&display13EDPAuxBLPending,(1ULL<<32)|brightness,__ATOMIC_RELEASE);
+ thread_call_enter(display13EDPAuxBLCall);
+ result=0;
+ return true;
 }
 uint32_t XE::wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
@@ -8071,7 +8085,8 @@ static Display13EDPBlank::State display13EDPBlankState;
 bool XE::processDisplay13EDPAuxBL(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  if(!display13EDPAuxBLRequested() || !display13FramebufferRequested)return false;
  if(!display13EDPAuxBLLock)display13EDPAuxBLLock=IOLockAlloc();
- if(!display13EDPAuxBLLock || !orgDisplay13ReadAUX || !orgDisplay13WriteAUX)return false;
+ if(!display13EDPAuxBLCall)display13EDPAuxBLCall=thread_call_allocate(display13EDPAuxBLWork,nullptr);
+ if(!display13EDPAuxBLLock || !display13EDPAuxBLCall || !orgDisplay13ReadAUX || !orgDisplay13WriteAUX)return false;
  // The Display13 panel path may already own hwSetBacklight (wrapADLSPanelBacklight
  // calls display13EDPAuxBrightness first). Otherwise route it here.
  {
