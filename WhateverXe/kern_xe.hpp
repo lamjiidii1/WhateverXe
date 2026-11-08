@@ -252,6 +252,10 @@ private:
     static uint32_t wrapDSISetAttribute(IOService *,uint32_t,uintptr_t);
     static uint32_t wrapDSISetConnectionAttribute(IOService *,int32_t,uint32_t,uintptr_t);
     static uint32_t wrapDSISetPowerState(IOService *,uint32_t);
+    // -wex-edp-blank: display sleep on a kept firmware eDP link (kern_display13_edp_blank).
+    bool processDisplay13EDPBlank(KernelPatcher &,size_t,mach_vm_address_t,size_t);
+    mach_vm_address_t orgDisplay13EDPPowerState {};
+    static uint32_t wrapDisplay13EDPPowerState(IOService *,uint32_t);
     mach_vm_address_t orgDSITransaction[5] {};
     static int beginDSIFramebufferWriter(IOService *);
     static uint32_t wrapDSIFlipTransaction(IOService *,void *,uint64_t,void *);

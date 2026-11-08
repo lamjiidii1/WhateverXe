@@ -53,6 +53,7 @@
 #include "kern_adls_boot.hpp"
 #include "kern_tgl_combo_signal.hpp"
 #include "kern_display13_edp_keep.hpp"
+#include "kern_display13_edp_blank.hpp"
 #include "kern_tgl_panel_depth.hpp"
 #include "kern_xelp_panel_power.hpp"
 #include "kern_display13_panel.hpp"
@@ -5521,6 +5522,8 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
     display13DSIModeHooksReady=processDisplay13DSIModes(patcher,index,address,size);
     dsiNativeWriterHooksReady=!adlnOutputWiring.dsi || (processDSINativeWriters(patcher,index,address,size) &&
         processDSINativeTransactions(patcher,index,address,size) && processDSINativeAttributes(patcher,index,address,size));
+    if(!adlnOutputWiring.dsi)
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlankReady",processDisplay13EDPBlank(patcher,index,address,size));
     dsiBootProbeReady=processDisplay13DSIBoot(patcher,index,address,size);
     dsiCacheHooksReady=processDisplay13DSICache(patcher,index,address,size);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBTopologyHooksReady",display13FBTopologyHooksReady);
@@ -7914,6 +7917,56 @@ bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *
   SYSLOG("igfx","eDP keep: firmware link not kept (reasons 0x%x, state %u, sink status %02x %02x %02x)",reasons,record.state,record.status[0],record.status[1],record.status[2]);
  return keep ? false : update;
 }
+// -wex-edp-blank (Display13EDPBlank): AppleIntelFramebuffer::setFramebufferPowerState
+// of the adopted boot panel on a kept link only blanks/unblanks the primary
+// plane and cursor; the donor's power transition (link stop, retraining) is
+// skipped and its recorded state (+0x4284, as in the DSI power path) updated.
+static bool display13EDPBlankRequested() {
+ static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-blank") ? 1 : 0;
+ return v==1;
+}
+static Display13EDPBlank::State display13EDPBlankState;
+bool XE::processDisplay13EDPBlank(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(!display13EDPBlankRequested() || !display13EDPKeep() || !display13FramebufferRequested || size<0x24E00)return false;
+ const char *symbol="__ZN21AppleIntelFramebuffer24setFramebufferPowerStateEj";
+ const uint8_t entry[20]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x41,0x89,0xF6,0x49,0x89,0xFF,0x48,0xFF,0x05,0xF1};
+ const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
+ if(fn!=address+0x24DE8 || memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry)))return false;
+ // Standard route: 16-byte prologue copied, before the RIP-relative counter.
+ KernelPatcher::RouteRequest route {symbol,wrapDisplay13EDPPowerState,orgDisplay13EDPPowerState};
+ const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+ return ready && orgDisplay13EDPPowerState;
+}
+uint32_t XE::wrapDisplay13EDPPowerState(IOService *fb,uint32_t state) {
+ namespace B=Display13EDPBlank;
+ auto s=callbackXE;auto &c=display13FBPower;auto &b=display13EDPBlankState;
+ B::Action action=B::Action::Native;bool eligible=false;uint32_t current=UINT32_MAX;
+ if(fb && c.lock && c.map && fb->getMetaClass()->getClassSize()>=0x4B90) {
+  IOLockLock(c.lock);
+  const auto base=c.map->getVirtualAddress();
+  const bool mapped=base && c.map->getLength()==0x1000000;
+  current=Display13FBMemory::field<uint32_t>(fb,0x4284);
+  eligible=mapped && display13EDPKeepKept && c.bootPanel && c.bridge.bootAdopted &&
+   Display13FBMemory::field<void *>(fb,0x1D0)==c.controller && Display13FBMemory::boundPipe(c.pipe,fb)==0;
+  action=mapped ? B::decide(eligible,current,state,b.blanked) : B::Action::Native;
+  struct IO {
+   uintptr_t base;
+   uint32_t read(uint32_t o) {return *reinterpret_cast<volatile uint32_t *>(base+o);}
+   void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
+  } io {base};
+  if(action==B::Action::Blank)B::blank(io,b);
+  else if(action==B::Action::Unblank)B::unblank(io,b);
+  if(eligible && action!=B::Action::Native)*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=state;
+  IOLockUnlock(c.lock);
+ }
+ // version, requested, previous, eligible, action, blanks, unblanks, plane, cursor
+ const uint32_t record[9]={1,state,current,eligible,static_cast<uint32_t>(action),b.blanks,b.unblanks,b.plane,b.cursor};
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlank",const_cast<uint32_t *>(record),sizeof(record));
+ if(eligible && action!=B::Action::Native)return kIOReturnSuccess;
+ // Not ours (or no longer ours after an unblank): the donor's own transition.
+ return FunctionCast(wrapDisplay13EDPPowerState,s->orgDisplay13EDPPowerState)(fb,state);
+}
+
 uint32_t XE::wrapDisplay13GMBus(IOService *controller,uint32_t bus,uint32_t speed,void *request) {
     // Extending the donor's pin bound is not permission to use an arbitrary
     // Type-C DDC bus. Only the retained controller's selected TMDS wiring
