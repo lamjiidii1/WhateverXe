@@ -7472,23 +7472,42 @@ struct Display13EDPAuxBLRecord {
  // last result, caps 0x701..0x703, 0x720, 0x721 before, mode/control writes
  uint32_t version,calls,written,declined,failures,brightness,level,result,caps,control,mode,modeWrites,controlWrites;
  uint8_t intel[4];
+ // stage of the last call (Display13EDPAuxBLStage), port source (1 captured
+ // native read, 2 getPortByDDI of the adopted boot port), DDI, port flags
+ uint32_t stage,source,ddi,flags;
 };
-static Display13EDPAuxBLRecord display13EDPAuxBLState {2};
+enum Display13EDPAuxBLStage : uint32_t {NoPort=1,TCON,CapsRead,StateRead,Unusable,Written,WriteFailed};
+static Display13EDPAuxBLRecord display13EDPAuxBLState {3};
+static mach_vm_address_t display13EDPAuxBLPortByDDI=0;
 bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t &result) {
  namespace A=Display13EDPAuxBL;
  if(!display13EDPAuxBLRequested() || !controller)return false;
  if(!display13EDPAuxBLLock)return false;
  auto port=__atomic_load_n(&display13EDPAuxBLPort,__ATOMIC_ACQUIRE);
  auto &r=display13EDPAuxBLState;
+ uint32_t source=port ? 1 : 0,ddi=UINT32_MAX;
+ if(!port && display13EDPAuxBLPortByDDI) {
+  // A kept DSC boot link has no resolvable path port, so the donor never
+  // reads the panel's DPCD; take the port object of the adopted boot DDI.
+  auto &c=display13FBPower;
+  if(c.lock){IOLockLock(c.lock);if(c.bootPanel && c.bridge.bootAdopted && c.bridge.bootPort<2)ddi=c.bridge.bootPort;IOLockUnlock(c.lock);}
+  if(ddi<2) {
+   port=reinterpret_cast<void *(*)(uint32_t)>(display13EDPAuxBLPortByDDI)(ddi);
+   if(port){source=2;__atomic_store_n(&display13EDPAuxBLPort,port,__ATOMIC_RELEASE);}
+  }
+ }
  IOLockLock(display13EDPAuxBLLock);
- ++r.calls;r.brightness=brightness;
+ ++r.calls;r.brightness=brightness;r.source=source;r.ddi=ddi;r.stage=NoPort;
  bool handled=false;
  // A Camellia/TCON-routed builtin port (+0x548 flags 0x18) is not ours.
  auto config=port ? Display13FBMemory::field<uint32_t *>(port,0x548) : nullptr;
+ if(config)r.flags=config[5];
+ if(config && (config[5]&0x18)==0x18)r.stage=TCON;
  if(config && (config[5]&0x18)!=0x18) {
   uint8_t caps[3] {},state[2] {};
   uint32_t e=wrapDisplay13ReadAUX(port,A::CapsAddress,caps,sizeof(caps));
-  if(!e)e=wrapDisplay13ReadAUX(port,A::ControlAddress,state,sizeof(state));
+  r.stage=CapsRead;
+  if(!e){e=wrapDisplay13ReadAUX(port,A::ControlAddress,state,sizeof(state));r.stage=StateRead;}
   if(!e && !r.intel[0] && !r.intel[1] && !r.intel[2] && !r.intel[3])wrapDisplay13ReadAUX(port,0x340,r.intel,sizeof(r.intel));
   if(!e) {
    r.caps=caps[0]|caps[1]<<8|caps[2]<<16;r.control=state[0];r.mode=state[1];
@@ -7499,11 +7518,11 @@ bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t
     if(!e){uint8_t l[2]={p.level[0],p.level[1]};e=wrapDisplay13WriteAUX(port,A::LevelAddress,l,p.levelLength);}
     r.level=p.value;
     handled=true;
-   } else ++r.declined;
+   } else {++r.declined;r.stage=Unusable;}
   }
   r.result=e;
-  if(handled && e)++r.failures;
-  else if(handled)++r.written;
+  if(handled && e){++r.failures;r.stage=WriteFailed;}
+  else if(handled){++r.written;r.stage=Written;}
  } else ++r.declined;
  if(handled)*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
  const auto copy=r;
@@ -8055,6 +8074,11 @@ bool XE::processDisplay13EDPAuxBL(KernelPatcher &patcher,size_t index,mach_vm_ad
  if(!display13EDPAuxBLLock || !orgDisplay13ReadAUX || !orgDisplay13WriteAUX)return false;
  // The Display13 panel path may already own hwSetBacklight (wrapADLSPanelBacklight
  // calls display13EDPAuxBrightness first). Otherwise route it here.
+ {
+  const uint8_t byDDI[]={0x55,0x48,0x89,0xe5,0x48,0xff,0x05};
+  const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN14AppleIntelPort12getPortByDDIEj",address,size);patcher.clearError();
+  if(fn==address+0x1b1ea && !memcmp(reinterpret_cast<void *>(fn),byDDI,sizeof(byDDI)))display13EDPAuxBLPortByDDI=fn;
+ }
  if(orgADLSPanelBacklight)return true;
  const char *symbol="__ZN31AppleIntelFramebufferController14hwSetBacklightEj";
  const uint8_t entry[]={0x55,0x48,0x89,0xe5,0x41,0x56,0x53,0x48,0xff,0x05,0x90,0x44,0x09,0x00};
