@@ -56,6 +56,7 @@
 #include "kern_tgl_combo_signal.hpp"
 #include "kern_display13_edp_keep.hpp"
 #include "kern_display13_edp_blank.hpp"
+#include "kern_display13_edp_auxbl.hpp"
 #include "kern_tgl_panel_depth.hpp"
 #include "kern_xelp_panel_power.hpp"
 #include "kern_display13_panel.hpp"
@@ -5573,6 +5574,7 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBLifecycleHooksReady",display13FBLifecycleHooksReady);
 	display13FBOutputHooksReady=processDisplay13FramebufferOutput(patcher,index,address,size);
     if(adlnOutputWiring.panel)processDisplay13Panel(patcher,index,address,size);
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPAuxBLReady",processDisplay13EDPAuxBL(patcher,index,address,size));
     display13FBTCHooksReady=processDisplay13FramebufferTC(patcher,index,address,size);
     if(!(adlnOutputWiring.selected()&0x78) && adlnOutputWiring.panel)processDisplay13Training(patcher,index,address,size);
     IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCHooksReady",display13FBTCHooksReady);
@@ -7433,6 +7435,8 @@ struct Display13EDPKeepRecord {
  uint32_t live[9],wanted[8];uint8_t status[8];
 };
 static volatile uint32_t display13EDPKeepCalls=0,display13EDPKeepKept=0;
+// -wex-edp-auxbl: the panel port, as last seen answering a native DPCD read.
+static void *display13EDPAuxBLPort=nullptr;
 uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_t length) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
  IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
@@ -7442,6 +7446,7 @@ uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_
  const auto ddi=complete ? Display13FBMemory::field<uint32_t>(port,0x120) : UINT32_MAX;
  const bool panel=ddi<2 && (callbackXE->adlnOutputWiring.panel&(1U<<ddi));IOLockUnlock(c.lock);
  if(!r && complete && panel && display13EDPKeep())Display13EDPKeep::capLinkCaps(address,static_cast<uint8_t *>(data),length,AlderLakeN::admitDSCPanel);
+ if(!r && complete && panel)__atomic_store_n(&display13EDPAuxBLPort,port,__ATOMIC_RELEASE);
  return r ? r : complete ? 0 : kIOReturnNotReady;
 }
 uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32_t length) {
@@ -7451,6 +7456,63 @@ uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32
  const auto r=FunctionCast(wrapDisplay13WriteAUX,callbackXE->orgDisplay13WriteAUX)(port,address,data,length);
  IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
  return r ? r : complete ? 0 : kIOReturnNotReady;
+}
+// -wex-edp-auxbl (Display13EDPAuxBL): hwSetBacklight of a kept type-5 AUX
+// panel writes the DPCD brightness through the native AUX path (with the
+// Display13 power checks of wrapDisplay13Read/WriteAUX) instead of the PWM
+// duty the panel ignores. Returns false to let the caller use its own path.
+static bool display13EDPAuxBLRequested() {
+ static int v=-1;
+ if(v<0)v=checkKernelArgument("-wex-edp-auxbl") && display13EDPKeep() && XELP::panelAUXBacklight ? 1 : 0;
+ return v==1;
+}
+static IOLock *display13EDPAuxBLLock=nullptr;
+struct Display13EDPAuxBLRecord {
+ // version, calls, written, declined, failures, last brightness, last level,
+ // last result, caps 0x701..0x703, 0x720, 0x721 before, mode/control writes
+ uint32_t version,calls,written,declined,failures,brightness,level,result,caps,control,mode,modeWrites,controlWrites;
+ uint8_t intel[4];
+};
+static Display13EDPAuxBLRecord display13EDPAuxBLState {2};
+bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t &result) {
+ namespace A=Display13EDPAuxBL;
+ if(!display13EDPAuxBLRequested() || !controller)return false;
+ if(!display13EDPAuxBLLock)return false;
+ auto port=__atomic_load_n(&display13EDPAuxBLPort,__ATOMIC_ACQUIRE);
+ auto &r=display13EDPAuxBLState;
+ IOLockLock(display13EDPAuxBLLock);
+ ++r.calls;r.brightness=brightness;
+ bool handled=false;
+ // A Camellia/TCON-routed builtin port (+0x548 flags 0x18) is not ours.
+ auto config=port ? Display13FBMemory::field<uint32_t *>(port,0x548) : nullptr;
+ if(config && (config[5]&0x18)!=0x18) {
+  uint8_t caps[3] {},state[2] {};
+  uint32_t e=wrapDisplay13ReadAUX(port,A::CapsAddress,caps,sizeof(caps));
+  if(!e)e=wrapDisplay13ReadAUX(port,A::ControlAddress,state,sizeof(state));
+  if(!e && !r.intel[0] && !r.intel[1] && !r.intel[2] && !r.intel[3])wrapDisplay13ReadAUX(port,0x340,r.intel,sizeof(r.intel));
+  if(!e) {
+   r.caps=caps[0]|caps[1]<<8|caps[2]<<16;r.control=state[0];r.mode=state[1];
+   const auto p=A::plan(A::Caps{caps[0],caps[1],caps[2]},state[0],state[1],brightness);
+   if(p.usable) {
+    if(p.writeMode){uint8_t m=p.mode;e=wrapDisplay13WriteAUX(port,A::ModeAddress,&m,1);++r.modeWrites;}
+    if(!e && p.writeControl){uint8_t c=p.control;e=wrapDisplay13WriteAUX(port,A::ControlAddress,&c,1);++r.controlWrites;}
+    if(!e){uint8_t l[2]={p.level[0],p.level[1]};e=wrapDisplay13WriteAUX(port,A::LevelAddress,l,p.levelLength);}
+    r.level=p.value;
+    handled=true;
+   } else ++r.declined;
+  }
+  r.result=e;
+  if(handled && e)++r.failures;
+  else if(handled)++r.written;
+ } else ++r.declined;
+ if(handled)*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
+ const auto copy=r;
+ IOLockUnlock(display13EDPAuxBLLock);
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPAuxBL",const_cast<Display13EDPAuxBLRecord *>(&copy),sizeof(copy));
+ // A failed AUX write still owns the request: the PWM duty would not reach
+ // this panel either, and a retry follows with the next slider step.
+ result=handled && copy.result ? uint32_t(kIOReturnNotResponding) : 0;
+ return handled;
 }
 uint32_t XE::wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
@@ -7987,6 +8049,21 @@ static bool display13EDPBlankRequested() {
  return v==1;
 }
 static Display13EDPBlank::State display13EDPBlankState;
+bool XE::processDisplay13EDPAuxBL(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(!display13EDPAuxBLRequested() || !display13FramebufferRequested)return false;
+ if(!display13EDPAuxBLLock)display13EDPAuxBLLock=IOLockAlloc();
+ if(!display13EDPAuxBLLock || !orgDisplay13ReadAUX || !orgDisplay13WriteAUX)return false;
+ // The Display13 panel path may already own hwSetBacklight (wrapADLSPanelBacklight
+ // calls display13EDPAuxBrightness first). Otherwise route it here.
+ if(orgADLSPanelBacklight)return true;
+ const char *symbol="__ZN31AppleIntelFramebufferController14hwSetBacklightEj";
+ const uint8_t entry[]={0x55,0x48,0x89,0xe5,0x41,0x56,0x53,0x48,0xff,0x05,0x90,0x44,0x09,0x00};
+ const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
+ if(size<0x4a5d4 || fn!=address+0x4a56a || memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry)))return false;
+ KernelPatcher::RouteRequest route {symbol,wrapADLSPanelBacklight,orgADLSPanelBacklight};
+ const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+ return ready && orgADLSPanelBacklight;
+}
 bool XE::processDisplay13EDPBlank(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  if(!display13EDPBlankRequested() || !display13EDPKeep() || !display13FramebufferRequested || size<0x24E00)return false;
  const char *symbol="__ZN21AppleIntelFramebuffer24setFramebufferPowerStateEj";
@@ -13912,6 +13989,7 @@ uint32_t XE::wrapADLSLightUpEDP(void *controller,void *fb,void *path,const void 
 }
 uint32_t XE::wrapADLSPanelBacklight(void *controller,uint32_t brightness) {
  auto s=callbackXE;
+ {uint32_t result=0;if(display13EDPAuxBrightness(controller,brightness,result))return result;}
  if(s->display13FramebufferRequested && s->adlnOutputWiring.panel)return display13PanelBrightness(controller,brightness);
  if(!s->adlsDisplaySelected || !s->adlsWiring.panel)
   return FunctionCast(wrapADLSPanelBacklight,s->orgADLSPanelBacklight)(controller,brightness);

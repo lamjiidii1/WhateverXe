@@ -254,6 +254,9 @@ private:
     static uint32_t wrapDSISetPowerState(IOService *,uint32_t);
     // -wex-edp-blank: display sleep on a kept firmware eDP link (kern_display13_edp_blank).
     bool processDisplay13EDPBlank(KernelPatcher &,size_t,mach_vm_address_t,size_t);
+    // -wex-edp-auxbl: VESA AUX brightness of a kept type-5 eDP panel (kern_display13_edp_auxbl).
+    bool processDisplay13EDPAuxBL(KernelPatcher &,size_t,mach_vm_address_t,size_t);
+    static bool display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t &result);
     mach_vm_address_t orgDisplay13EDPPowerState {};
     static uint32_t wrapDisplay13EDPPowerState(IOService *,uint32_t);
     mach_vm_address_t orgDSITransaction[5] {};
