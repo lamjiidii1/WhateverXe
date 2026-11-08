@@ -7481,9 +7481,12 @@ struct Display13EDPAuxBLRecord {
  uint32_t interface,rechecks;
  uint8_t dump340[32],dump700[56];
  uint32_t intelReleases; // times 0x344 bit4 was cleared for VESA
+ // Last 32 requests (hwSetBacklight) and writes, each (ms & 0xFFFF)<<16 | value,
+ // and the index of the next slot in each ring.
+ uint32_t reqNext,writeNext,req[32],write[32];
 };
 enum Display13EDPAuxBLStage : uint32_t {NoPort=1,TCON,CapsRead,StateRead,Unusable,Written,WriteFailed};
-static Display13EDPAuxBLRecord display13EDPAuxBLState {7};
+static Display13EDPAuxBLRecord display13EDPAuxBLState {8};
 static mach_vm_address_t display13EDPAuxBLPortByDDI=0;
 static bool display13EDPAuxBLIntel() {
  static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-auxbl-intel") ? 1 : 0;
@@ -7565,6 +7568,7 @@ void XE::display13EDPAuxBLApply(uint32_t brightness) {
      if(!e && p.writeControl){uint8_t c=p.control;e=wrapDisplay13WriteAUX(port,A::ControlAddress,&c,1);++r.controlWrites;if(!e)r.control=c;}
      if(!e){uint8_t l[2]={p.level[0],p.level[1]};e=wrapDisplay13WriteAUX(port,A::LevelAddress,l,p.levelLength);}
      r.level=p.value;
+     r.write[r.writeNext++%32]=static_cast<uint32_t>((now/1000000ULL)&0xFFFF)<<16|p.value;
      handled=true;
     } else {++r.declined;r.stage=Unusable;}
    }
@@ -7592,6 +7596,13 @@ void XE::display13EDPAuxBLWork(thread_call_param_t,thread_call_param_t) {
 }
 bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t &result) {
  if(!display13EDPAuxBLRequested() || !controller || !display13EDPAuxBLLock || !display13EDPAuxBLCall)return false;
+ {
+  uint64_t now=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&now);
+  auto &r=display13EDPAuxBLState;
+  IOLockLock(display13EDPAuxBLLock);
+  r.req[r.reqNext++%32]=static_cast<uint32_t>((now/1000000ULL)&0xFFFF)<<16|(brightness>0xFFFF ? 0xFFFF : brightness);
+  IOLockUnlock(display13EDPAuxBLLock);
+ }
  // The panel ignores the PWM duty; never fall back to it (or to its power path).
  *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
  __atomic_store_n(&display13EDPAuxBLPending,(1ULL<<32)|brightness,__ATOMIC_RELEASE);
