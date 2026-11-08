@@ -24,6 +24,10 @@ int main() {
     assert(p.levelLength==1 && p.level[0]==1);
     p=plan(Caps{0,0x02,0},0,2,0xAB00);
     assert(p.levelLength==1 && p.level[0]==0xAB);
+    // Intel interface: Galaxy Book3 Ultra caps 01 57 01 00.
+    assert((IntelCaps{{0x01,0x57,0x01,0x00}}.usable()));
+    assert((!IntelCaps{{0x01,0x47,0x01,0x00}}.usable() && !IntelCaps{{0x01,0x57,0x00,0x00}}.usable()));
+    assert(nits(0)==IntelMinNits && nits(0xFFFF)==IntelMaxNits && nits(0x7FFF)==201 && nits(0x20000)==IntelMaxNits);
     puts("display13_edp_auxbl: ok");
     return 0;
 }

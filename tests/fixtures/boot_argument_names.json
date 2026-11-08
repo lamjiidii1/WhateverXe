@@ -153,6 +153,7 @@
   "-wex-edp-blank": [],
   "-wex-mtl-poshfix": [],
   "-wex-edp-auxbl": [],
+  "-wex-edp-auxbl-intel": [],
   "-wex-dsi-hdmi-test": [],
   "-wex-dsi-power-test": []
 }

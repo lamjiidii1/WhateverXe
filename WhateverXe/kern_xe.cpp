@@ -7468,17 +7468,29 @@ static bool display13EDPAuxBLRequested() {
 }
 static IOLock *display13EDPAuxBLLock=nullptr;
 struct Display13EDPAuxBLRecord {
- // version, calls, written, declined, failures, last brightness, last level,
- // last result, caps 0x701..0x703, 0x720, 0x721 before, mode/control writes
+ // version, calls, written, declined, failures, last brightness, last level
+ // (VESA level or Intel nits), last result, caps 0x701..0x703, 0x720, 0x721,
+ // mode/control writes
  uint32_t version,calls,written,declined,failures,brightness,level,result,caps,control,mode,modeWrites,controlWrites;
  uint8_t intel[4];
  // stage of the last call (Display13EDPAuxBLStage), port source (1 captured
  // native read, 2 getPortByDDI of the adopted boot port), DDI, port flags
  uint32_t stage,source,ddi,flags;
+ // interface (1 VESA, 2 Intel), mode rechecks, first-call dumps of
+ // 0x340..0x35F and 0x700..0x737 before anything was written
+ uint32_t interface,rechecks;
+ uint8_t dump340[32],dump700[56];
 };
 enum Display13EDPAuxBLStage : uint32_t {NoPort=1,TCON,CapsRead,StateRead,Unusable,Written,WriteFailed};
-static Display13EDPAuxBLRecord display13EDPAuxBLState {5};
+static Display13EDPAuxBLRecord display13EDPAuxBLState {6};
 static mach_vm_address_t display13EDPAuxBLPortByDDI=0;
+static bool display13EDPAuxBLIntel() {
+ static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-auxbl-intel") ? 1 : 0;
+ return v==1;
+}
+static uint64_t display13EDPAuxBLLastNs=0;
+static bool display13EDPAuxBLCapsValid=false;
+static uint8_t display13EDPAuxBLCaps[3] {};
 void XE::display13EDPAuxBLApply(uint32_t brightness) {
  namespace A=Display13EDPAuxBL;
  auto port=__atomic_load_n(&display13EDPAuxBLPort,__ATOMIC_ACQUIRE);
@@ -7504,24 +7516,51 @@ void XE::display13EDPAuxBLApply(uint32_t brightness) {
  auto config=port ? Display13FBMemory::field<uint32_t *>(port,0x548) : nullptr;
  if(config)r.flags=config[5];
  if(config) {
-  uint8_t caps[3] {},state[2] {};
-  uint32_t e=wrapDisplay13ReadAUX(port,A::CapsAddress,caps,sizeof(caps));
-  r.stage=CapsRead;
-  if(!e){e=wrapDisplay13ReadAUX(port,A::ControlAddress,state,sizeof(state));r.stage=StateRead;}
-  if(!e && !r.intel[0] && !r.intel[1] && !r.intel[2] && !r.intel[3])wrapDisplay13ReadAUX(port,0x340,r.intel,sizeof(r.intel));
-  if(!e) {
-   r.caps=caps[0]|caps[1]<<8|caps[2]<<16;r.control=state[0];r.mode=state[1];
-   const auto p=A::plan(A::Caps{caps[0],caps[1],caps[2]},state[0],state[1],brightness);
-   if(p.usable) {
-    if(p.writeMode){uint8_t m=p.mode;e=wrapDisplay13WriteAUX(port,A::ModeAddress,&m,1);++r.modeWrites;}
-    if(!e && p.writeControl){uint8_t c=p.control;e=wrapDisplay13WriteAUX(port,A::ControlAddress,&c,1);++r.controlWrites;}
-    if(!e){uint8_t l[2]={p.level[0],p.level[1]};e=wrapDisplay13WriteAUX(port,A::LevelAddress,l,p.levelLength);}
-    r.level=p.value;
-    handled=true;
-   } else {++r.declined;r.stage=Unusable;}
+  uint32_t e=0;
+  // Every AUX transaction wakes the link out of its low-power state; keep
+  // them to one write per slider step. Capabilities are read once, and the
+  // mode/enable registers again only after a pause (a doze may reset them).
+  if(!display13EDPAuxBLCapsValid) {
+   r.stage=CapsRead;
+   wrapDisplay13ReadAUX(port,0x340,r.dump340,sizeof(r.dump340));
+   for(unsigned o=0;o<sizeof(r.dump700);o+=16)
+    wrapDisplay13ReadAUX(port,0x700+o,r.dump700+o,sizeof(r.dump700)-o<16 ? sizeof(r.dump700)-o : 16);
+   memcpy(r.intel,r.dump340,sizeof(r.intel));
+   e=wrapDisplay13ReadAUX(port,A::CapsAddress,display13EDPAuxBLCaps,sizeof(display13EDPAuxBLCaps));
+   if(!e)display13EDPAuxBLCapsValid=true;
   }
+  uint64_t now=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&now);
+  const bool recheck=!display13EDPAuxBLLastNs || now-display13EDPAuxBLLastNs>500000000ULL;
+  const auto &caps=display13EDPAuxBLCaps;
+  r.caps=caps[0]|caps[1]<<8|caps[2]<<16;
+  if(!e && display13EDPAuxBLIntel() && A::IntelCaps{{r.intel[0],r.intel[1],r.intel[2],r.intel[3]}}.usable()) {
+   r.interface=2;r.stage=StateRead;
+   if(recheck) {
+    ++r.rechecks;uint8_t ctrl=0;e=wrapDisplay13ReadAUX(port,A::IntelControlAddress,&ctrl,1);r.control=ctrl;
+    if(!e && !(ctrl&A::IntelBrightnessAuxEnable)){ctrl|=A::IntelBrightnessAuxEnable;e=wrapDisplay13WriteAUX(port,A::IntelControlAddress,&ctrl,1);++r.controlWrites;}
+   }
+   const auto n=A::nits(brightness);
+   if(!e){uint8_t l[2]={static_cast<uint8_t>(n),static_cast<uint8_t>(n>>8)};e=wrapDisplay13WriteAUX(port,A::IntelNitsAddress,l,sizeof(l));}
+   r.level=n;handled=true;
+  } else if(!e) {
+   r.interface=1;
+   uint8_t state[2]={static_cast<uint8_t>(r.control),static_cast<uint8_t>(r.mode)};
+   if(recheck){++r.rechecks;r.stage=StateRead;e=wrapDisplay13ReadAUX(port,A::ControlAddress,state,sizeof(state));}
+   if(!e) {
+    r.control=state[0];r.mode=state[1];
+    const auto p=A::plan(A::Caps{caps[0],caps[1],caps[2]},state[0],state[1],brightness);
+    if(p.usable) {
+     if(p.writeMode){uint8_t m=p.mode;e=wrapDisplay13WriteAUX(port,A::ModeAddress,&m,1);++r.modeWrites;if(!e)r.mode=m;}
+     if(!e && p.writeControl){uint8_t c=p.control;e=wrapDisplay13WriteAUX(port,A::ControlAddress,&c,1);++r.controlWrites;if(!e)r.control=c;}
+     if(!e){uint8_t l[2]={p.level[0],p.level[1]};e=wrapDisplay13WriteAUX(port,A::LevelAddress,l,p.levelLength);}
+     r.level=p.value;
+     handled=true;
+    } else {++r.declined;r.stage=Unusable;}
+   }
+  }
+  display13EDPAuxBLLastNs=now;
   r.result=e;
-  if(handled && e){++r.failures;r.stage=WriteFailed;}
+  if(handled && e){++r.failures;r.stage=WriteFailed;display13EDPAuxBLLastNs=0;}
   else if(handled){++r.written;r.stage=Written;}
  } else ++r.declined;
  const auto copy=r;

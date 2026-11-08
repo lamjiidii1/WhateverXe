@@ -35,6 +35,21 @@ struct Plan {
     uint16_t value {};
 };
 
+// Intel eDP HDR/SDR TCON interface (Linux intel_dp_aux_backlight.c), which
+// Windows uses on Samsung OLEDs: 0x341 bit4 brightness in nits, 0x342 bit0
+// SDR brightness over AUX, 0x344 bit4 brightness AUX enable, 0x354/0x355 nits.
+constexpr uint32_t IntelCapsAddress=0x340,IntelControlAddress=0x344,IntelNitsAddress=0x354;
+constexpr uint8_t IntelBrightnessAuxEnable=0x10;
+constexpr uint16_t IntelMinNits=2,IntelMaxNits=400;
+struct IntelCaps {
+    uint8_t cap[4] {};
+    bool usable() const {return (cap[1]&0x10) && (cap[2]&0x01);}
+};
+inline uint16_t nits(uint32_t brightness) {
+    const uint32_t b=brightness>0xFFFF ? 0xFFFF : brightness;
+    return static_cast<uint16_t>(IntelMinNits+(uint64_t(IntelMaxNits-IntelMinNits)*b+0x7FFF)/0xFFFF);
+}
+
 inline uint16_t level(uint32_t brightness) {
     const uint32_t b=brightness>0xFFFF ? 0xFFFF : brightness;
     return static_cast<uint16_t>(b<Floor ? Floor : b);
