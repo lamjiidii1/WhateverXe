@@ -4354,35 +4354,55 @@ bool XE::xelpInstallHostRPS(KernelPatcher &patcher,size_t index,mach_vm_address_
 }
 
 // -wex-mtl-poshfix (MTLPoshFix): patch the TGL Metal donor's command buffer
-// dealloc when its page is validated on page-in, as Lilu's UserPatcher does.
+// dealloc when its code is validated on page-in, as Lilu's UserPatcher does.
 // The bundle lives on the data volume, so a boot-time file lookup cannot see it.
-static mach_vm_address_t mtlPoshOrgValidateRange {};
+// Both validation entry points are routed when present; the patch is idempotent.
+static mach_vm_address_t mtlPoshOrgValidateRange {}, mtlPoshOrgValidatePage {};
 static uint32_t mtlPoshReady {}, mtlPoshPages {}, mtlPoshWriteFailures {};
-static boolean_t mtlPoshValidateRange(void *blobs,void *pager,uint64_t offset,const void *data,uint64_t size,unsigned *tainted) {
- const auto res=FunctionCast(mtlPoshValidateRange,mtlPoshOrgValidateRange)(blobs,pager,offset,data,size,tainted);
- if(res)MTLPoshFix::forEachMatch(static_cast<const uint8_t *>(data),size,[](uint8_t *page) {
+static uint64_t mtlPoshRangeCalls {}, mtlPoshPageCalls {}, mtlPoshBytes {};
+static void mtlPoshScan(const void *data,uint64_t size) {
+ __atomic_fetch_add(&mtlPoshBytes,size,__ATOMIC_RELAXED);
+ MTLPoshFix::forEachMatch(static_cast<const uint8_t *>(data),size,[](uint8_t *at) {
   if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS) {
    __atomic_fetch_add(&mtlPoshWriteFailures,1U,__ATOMIC_RELAXED);return;
   }
-  const bool done=MTLPoshFix::apply(page);
+  const bool done=MTLPoshFix::apply(at);
   MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
   if(done)__atomic_fetch_add(&mtlPoshPages,1U,__ATOMIC_RELAXED);
  });
+}
+static boolean_t mtlPoshValidateRange(void *blobs,void *pager,uint64_t offset,const void *data,uint64_t size,unsigned *tainted) {
+ const auto res=FunctionCast(mtlPoshValidateRange,mtlPoshOrgValidateRange)(blobs,pager,offset,data,size,tainted);
+ __atomic_fetch_add(&mtlPoshRangeCalls,1ULL,__ATOMIC_RELAXED);
+ if(res)mtlPoshScan(data,size);
+ return res;
+}
+static boolean_t mtlPoshValidatePage(void *blobs,void *pager,uint64_t offset,const void *data,unsigned *tainted) {
+ const auto res=FunctionCast(mtlPoshValidatePage,mtlPoshOrgValidatePage)(blobs,pager,offset,data,tainted);
+ __atomic_fetch_add(&mtlPoshPageCalls,1ULL,__ATOMIC_RELAXED);
+ if(res)mtlPoshScan(data,MTLPoshFix::PageSize);
  return res;
 }
 static bool mtlPoshSerialize(void *,void *,OSSerialize *serializer) {
- // version, route ready, patched page-ins, write-enable failures
- const uint32_t q[4] {1,__atomic_load_n(&mtlPoshReady,__ATOMIC_RELAXED),
-  __atomic_load_n(&mtlPoshPages,__ATOMIC_RELAXED),__atomic_load_n(&mtlPoshWriteFailures,__ATOMIC_RELAXED)};
+ // version 2: ready mask (1 range, 2 page), patched sites, write failures,
+ // range calls, page calls, validated bytes
+ const uint64_t q[7] {2,__atomic_load_n(&mtlPoshReady,__ATOMIC_RELAXED),
+  __atomic_load_n(&mtlPoshPages,__ATOMIC_RELAXED),__atomic_load_n(&mtlPoshWriteFailures,__ATOMIC_RELAXED),
+  __atomic_load_n(&mtlPoshRangeCalls,__ATOMIC_RELAXED),__atomic_load_n(&mtlPoshPageCalls,__ATOMIC_RELAXED),
+  __atomic_load_n(&mtlPoshBytes,__ATOMIC_RELAXED)};
  auto d=OSData::withBytes(q,sizeof(q));if(!d)return false;
  const bool ok=d->serialize(serializer);d->release();return ok;
 }
 static void installMTLPoshFix(KernelPatcher &patcher) {
  if(!checkKernelArgument("-wex-mtl-poshfix"))return;
- KernelPatcher::RouteRequest route {"_cs_validate_range",mtlPoshValidateRange,mtlPoshOrgValidateRange};
- const bool ready=patcher.routeMultipleLong(KernelPatcher::KernelID,&route,1) && mtlPoshOrgValidateRange;
+ uint32_t ready=0;
+ KernelPatcher::RouteRequest range {"_cs_validate_range",mtlPoshValidateRange,mtlPoshOrgValidateRange};
+ if(patcher.routeMultipleLong(KernelPatcher::KernelID,&range,1) && mtlPoshOrgValidateRange)ready|=1;
  patcher.clearError();
- __atomic_store_n(&mtlPoshReady,ready ? 1U : 0U,__ATOMIC_RELAXED);
+ KernelPatcher::RouteRequest page {"_cs_validate_page",mtlPoshValidatePage,mtlPoshOrgValidatePage};
+ if(patcher.routeMultipleLong(KernelPatcher::KernelID,&page,1) && mtlPoshOrgValidatePage)ready|=2;
+ patcher.clearError();
+ __atomic_store_n(&mtlPoshReady,ready,__ATOMIC_RELAXED);
  if(auto s=OSSerializer::forTarget(nullptr,mtlPoshSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WEXMTLPoshFix",s);s->release();
  }

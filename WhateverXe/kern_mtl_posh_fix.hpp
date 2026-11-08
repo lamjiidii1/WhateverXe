@@ -33,21 +33,26 @@ constexpr uint8_t Find[43] {
 constexpr size_t PageSize=0x1000, PageOffset=0x7ED6B&(PageSize-1), JumpOffset=0x1C;
 static_assert(PageOffset+sizeof(Find)<=PageSize,"pattern must not cross a page");
 
-inline bool matches(const uint8_t *page) {
-    return page && !memcmp(page+PageOffset,Find,sizeof(Find));
+inline bool matches(const uint8_t *at) {
+    return at && !memcmp(at,Find,sizeof(Find));
 }
-// Patch an already matched page in place. Returns true when bytes changed.
-inline bool apply(uint8_t *page) {
-    if(!matches(page))return false;
-    page[PageOffset+JumpOffset]=0x90;page[PageOffset+JumpOffset+1]=0x90;
+// Patch an already matched site in place. Returns true when bytes changed.
+inline bool apply(uint8_t *at) {
+    if(!matches(at))return false;
+    at[JumpOffset]=0x90;at[JumpOffset+1]=0x90;
     return true;
 }
-// Pages in [data, data+size) that need the patch (validated range).
+// Every site in a validated range [data, data+size). Validation ranges are not
+// guaranteed to start at the page holding file offset 0x7E000, so search the
+// whole range instead of a fixed in-page offset; the 43 bytes include two
+// RIP-relative ivar displacements and a call displacement unique to this file.
 template<class F> size_t forEachMatch(const uint8_t *data,uint64_t size,F f) {
     size_t n=0;
-    if(!data)return 0;
-    for(uint64_t o=0;o+PageSize<=size;o+=PageSize)
-        if(matches(data+o)){f(const_cast<uint8_t *>(data+o));++n;}
+    if(!data || size<sizeof(Find))return 0;
+    for(uint64_t o=0;o+sizeof(Find)<=size;++o)
+        if(data[o]==Find[0] && data[o+1]==Find[1] && data[o+2]==Find[2] && data[o+3]==Find[3] && matches(data+o)) {
+            f(const_cast<uint8_t *>(data+o));++n;o+=sizeof(Find)-1;
+        }
     return n;
 }
 }
