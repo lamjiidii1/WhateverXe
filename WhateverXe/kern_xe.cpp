@@ -7480,9 +7480,10 @@ struct Display13EDPAuxBLRecord {
  // 0x340..0x35F and 0x700..0x737 before anything was written
  uint32_t interface,rechecks;
  uint8_t dump340[32],dump700[56];
+ uint32_t intelReleases; // times 0x344 bit4 was cleared for VESA
 };
 enum Display13EDPAuxBLStage : uint32_t {NoPort=1,TCON,CapsRead,StateRead,Unusable,Written,WriteFailed};
-static Display13EDPAuxBLRecord display13EDPAuxBLState {6};
+static Display13EDPAuxBLRecord display13EDPAuxBLState {7};
 static mach_vm_address_t display13EDPAuxBLPortByDDI=0;
 static bool display13EDPAuxBLIntel() {
  static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-auxbl-intel") ? 1 : 0;
@@ -7546,6 +7547,16 @@ void XE::display13EDPAuxBLApply(uint32_t brightness) {
    r.interface=1;
    uint8_t state[2]={static_cast<uint8_t>(r.control),static_cast<uint8_t>(r.mode)};
    if(recheck){++r.rechecks;r.stage=StateRead;e=wrapDisplay13ReadAUX(port,A::ControlAddress,state,sizeof(state));}
+   // The firmware leaves the Intel TCON brightness (0x344 bit4) in charge;
+   // with both interfaces enabled the panel flashes on every VESA write.
+   // Hand brightness to VESA alone, as Linux does when it uses VESA.
+   if(!e && recheck && A::IntelCaps{{r.intel[0],r.intel[1],r.intel[2],r.intel[3]}}.usable()) {
+    uint8_t ctrl=0;
+    if(!wrapDisplay13ReadAUX(port,A::IntelControlAddress,&ctrl,1) && (ctrl&A::IntelBrightnessAuxEnable)) {
+     ctrl&=~A::IntelBrightnessAuxEnable;
+     if(!wrapDisplay13WriteAUX(port,A::IntelControlAddress,&ctrl,1))++r.intelReleases;
+    }
+   }
    if(!e) {
     r.control=state[0];r.mode=state[1];
     const auto p=A::plan(A::Caps{caps[0],caps[1],caps[2]},state[0],state[1],brightness);
