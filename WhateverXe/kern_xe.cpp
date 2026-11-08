@@ -4377,16 +4377,19 @@ static boolean_t mtlPoshValidateRange(void *blobs,void *pager,uint64_t offset,co
  if(res)mtlPoshScan(data,size);
  return res;
 }
-static boolean_t mtlPoshValidatePage(void *blobs,void *pager,uint64_t offset,const void *data,unsigned *tainted) {
- const auto res=FunctionCast(mtlPoshValidatePage,mtlPoshOrgValidatePage)(blobs,pager,offset,data,tainted);
+// xnu bsd/kern/ubc_subr.c: void cs_validate_page(vnode_t, memory_object_t,
+// memory_object_offset_t, const void *data, int *validated_p, int *tainted_p,
+// int *nx_p). The vm_fault x86 path validates 4K pages here; the result is the
+// validated_p out-parameter, not a return value. Forward all seven arguments.
+static void mtlPoshValidatePage(void *vp,void *pager,uint64_t offset,const void *data,int *validated,int *tainted,int *nx) {
+ FunctionCast(mtlPoshValidatePage,mtlPoshOrgValidatePage)(vp,pager,offset,data,validated,tainted,nx);
  __atomic_fetch_add(&mtlPoshPageCalls,1ULL,__ATOMIC_RELAXED);
- if(res)mtlPoshScan(data,MTLPoshFix::PageSize);
- return res;
+ if(validated && *validated && !(tainted && *tainted))mtlPoshScan(data,MTLPoshFix::PageSize);
 }
 static bool mtlPoshSerialize(void *,void *,OSSerialize *serializer) {
- // version 2: ready mask (1 range, 2 page), patched sites, write failures,
+ // version 3: ready mask (1 range, 2 page), patched sites, write failures,
  // range calls, page calls, validated bytes
- const uint64_t q[7] {2,__atomic_load_n(&mtlPoshReady,__ATOMIC_RELAXED),
+ const uint64_t q[7] {3,__atomic_load_n(&mtlPoshReady,__ATOMIC_RELAXED),
   __atomic_load_n(&mtlPoshPages,__ATOMIC_RELAXED),__atomic_load_n(&mtlPoshWriteFailures,__ATOMIC_RELAXED),
   __atomic_load_n(&mtlPoshRangeCalls,__ATOMIC_RELAXED),__atomic_load_n(&mtlPoshPageCalls,__ATOMIC_RELAXED),
   __atomic_load_n(&mtlPoshBytes,__ATOMIC_RELAXED)};
