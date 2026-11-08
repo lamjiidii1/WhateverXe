@@ -150,6 +150,7 @@
   "-wex-edp-dsc": [],
   "-wex-edp-60": [],
   "-wex-edp-dsc-retrain": [],
+  "-wex-edp-blank": [],
   "-wex-dsi-hdmi-test": [],
   "-wex-dsi-power-test": []
 }
