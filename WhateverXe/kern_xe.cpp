@@ -7484,9 +7484,10 @@ struct Display13EDPAuxBLRecord {
  // Last 32 requests (hwSetBacklight) and writes, each (ms & 0xFFFF)<<16 | value,
  // and the index of the next slot in each ring.
  uint32_t reqNext,writeNext,req[32],write[32];
+ uint32_t maxLevel; // level range the panel accepts (0x724 bit count)
 };
 enum Display13EDPAuxBLStage : uint32_t {NoPort=1,TCON,CapsRead,StateRead,Unusable,Written,WriteFailed};
-static Display13EDPAuxBLRecord display13EDPAuxBLState {9};
+static Display13EDPAuxBLRecord display13EDPAuxBLState {10};
 static mach_vm_address_t display13EDPAuxBLPortByDDI=0;
 static bool display13EDPAuxBLIntel() {
  static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-auxbl-intel") ? 1 : 0;
@@ -7495,6 +7496,7 @@ static bool display13EDPAuxBLIntel() {
 static uint64_t display13EDPAuxBLLastNs=0;
 static bool display13EDPAuxBLCapsValid=false;
 static uint8_t display13EDPAuxBLCaps[3] {};
+static uint16_t display13EDPAuxBLMax=0;
 void XE::display13EDPAuxBLApply(uint32_t brightness) {
  namespace A=Display13EDPAuxBL;
  auto port=__atomic_load_n(&display13EDPAuxBLPort,__ATOMIC_ACQUIRE);
@@ -7531,7 +7533,12 @@ void XE::display13EDPAuxBLApply(uint32_t brightness) {
     wrapDisplay13ReadAUX(port,0x700+o,r.dump700+o,sizeof(r.dump700)-o<16 ? sizeof(r.dump700)-o : 16);
    memcpy(r.intel,r.dump340,sizeof(r.intel));
    e=wrapDisplay13ReadAUX(port,A::CapsAddress,display13EDPAuxBLCaps,sizeof(display13EDPAuxBLCaps));
-   if(!e)display13EDPAuxBLCapsValid=true;
+   uint8_t bits[3] {};
+   if(!e)e=wrapDisplay13ReadAUX(port,A::BitCountAddress,bits,sizeof(bits));
+   if(!e) {
+    display13EDPAuxBLMax=A::maxLevel(A::Caps{display13EDPAuxBLCaps[0],display13EDPAuxBLCaps[1],display13EDPAuxBLCaps[2]},bits[0],bits[1],bits[2]);
+    display13EDPAuxBLCapsValid=true;
+   }
   }
   uint64_t now=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&now);
   const bool recheck=!display13EDPAuxBLLastNs || now-display13EDPAuxBLLastNs>500000000ULL;
@@ -7562,7 +7569,8 @@ void XE::display13EDPAuxBLApply(uint32_t brightness) {
    }
    if(!e) {
     r.control=state[0];r.mode=state[1];
-    const auto p=A::plan(A::Caps{caps[0],caps[1],caps[2]},state[0],state[1],brightness);
+    const auto p=A::plan(A::Caps{caps[0],caps[1],caps[2]},state[0],state[1],brightness,display13EDPAuxBLMax);
+    r.maxLevel=display13EDPAuxBLMax;
     if(p.usable) {
      if(p.writeMode){uint8_t m=p.mode;e=wrapDisplay13WriteAUX(port,A::ModeAddress,&m,1);++r.modeWrites;if(!e)r.mode=m;}
      if(!e && p.writeControl){uint8_t c=p.control;e=wrapDisplay13WriteAUX(port,A::ControlAddress,&c,1);++r.controlWrites;if(!e)r.control=c;}

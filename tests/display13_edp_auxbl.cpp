@@ -16,14 +16,28 @@ int main() {
     assert(p.writeMode && p.mode==0x82);
     // No AUX enable capability: 0x720 is left alone.
     assert(!plan(Caps{0x02,0x06,0},0x00,0x02,0x8000).writeControl);
-    // Floor and clamp.
-    assert(plan(Caps{0,0x06,0},0,2,0).value==Floor);
+    // Floor and clamp (16-bit range).
+    assert(plan(Caps{0,0x06,0},0,2,0).value==0xFF);
     assert(plan(Caps{0,0x06,0},0,2,0x12345).value==0xFFFF);
-    // 8-bit panel: MSB only, never 0.
+    // 8-bit panel: whole byte, never 0.
     p=plan(Caps{0,0x02,0},0,2,0x0180);
     assert(p.levelLength==1 && p.level[0]==1);
-    p=plan(Caps{0,0x02,0},0,2,0xAB00);
-    assert(p.levelLength==1 && p.level[0]==0xAB);
+    p=plan(Caps{0,0x02,0},0,2,0xFFFF);
+    assert(p.levelLength==1 && p.level[0]==0xFF);
+    p=plan(Caps{0,0x02,0},0,2,0);
+    assert(p.level[0]==1);
+    // Galaxy Book3 Ultra: 0x702=0xA6 (16-bit, FREQ_AUX_SET), 0x724..0x726 = 00 0b 0b.
+    Caps gb{0x9b,0xa6,0x04};
+    assert(maxLevel(gb,0x00,0x0b,0x0b)==0x7FF);
+    assert(maxLevel(gb,0x0c,0x0b,0x0b)==0x7FF && maxLevel(gb,0x09,0x0b,0x0c)==0x7FF);
+    assert(maxLevel(Caps{0,0x06,0},0,0x0b,0x0b)==0xFFFF && maxLevel(Caps{0,0x02,0},0,0,0)==0xFF);
+    p=plan(gb,0,2,0xFFFF,0x7FF);
+    assert(p.value==0x7FF && p.level[0]==0x07 && p.level[1]==0xFF);
+    p=plan(gb,0,2,0x8000,0x7FF);
+    assert(p.value==0x400);
+    assert(plan(gb,0,2,0,0x7FF).value==7);
+    // Monotonic: no wrap anywhere in the range.
+    for(uint32_t v=0,prev=0;v<=0xFFFF;v+=0x41){auto q=plan(gb,0,2,v,0x7FF);assert(q.value>=prev && q.value<=0x7FF);prev=q.value;}
     // Intel interface: Galaxy Book3 Ultra caps 01 57 01 00.
     assert((IntelCaps{{0x01,0x57,0x01,0x00}}.usable()));
     assert((!IntelCaps{{0x01,0x47,0x01,0x00}}.usable() && !IntelCaps{{0x01,0x57,0x00,0x00}}.usable()));

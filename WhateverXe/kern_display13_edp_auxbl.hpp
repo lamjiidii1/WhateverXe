@@ -17,8 +17,7 @@
 namespace Display13EDPAuxBL {
 constexpr uint32_t CapsAddress=0x701,ControlAddress=0x720,ModeAddress=0x721,LevelAddress=0x722;
 constexpr uint8_t ModeMask=0x03,ModeDPCD=0x02,BacklightEnable=0x01;
-// Never write 0: an OLED at level 0 is black, not "minimum".
-constexpr uint16_t Floor=0x0100;
+// Never write 0: an OLED at level 0 is black, not "minimum" (floor max/256).
 
 struct Caps {
     uint8_t general1 {},adjust {},adjust2 {};
@@ -50,21 +49,39 @@ inline uint16_t nits(uint32_t brightness) {
     return static_cast<uint16_t>(IntelMinNits+(uint64_t(IntelMaxNits-IntelMinNits)*b+0x7FFF)/0xFFFF);
 }
 
-inline uint16_t level(uint32_t brightness) {
+// Brightness range. With BACKLIGHT_FREQ_AUX_SET_CAP (0x702 bit5) the level
+// register is only PWMGEN_BIT_COUNT (0x724, clamped to 0x725..0x726) bits wide
+// (Linux drm_edp_backlight_probe_max): the Samsung ATNA60CL03 reports 11 bits,
+// so 16-bit levels above 0x7FF wrapped and the panel flashed on slow ramps.
+constexpr uint32_t BitCountAddress=0x724;
+inline uint16_t maxLevel(const Caps &caps,uint8_t count,uint8_t minimum,uint8_t maximum) {
+    if(!caps.wide())return 0xFF;
+    if(!(caps.adjust&0x20))return 0xFFFF;
+    uint8_t lo=minimum&0x1F,hi=maximum&0x1F,pn=count&0x1F;
+    if(!pn)pn=hi;
+    if(lo && pn<lo)pn=lo;
+    if(hi && pn>hi)pn=hi;
+    if(!pn || pn>16)return 0xFFFF;
+    return static_cast<uint16_t>((1U<<pn)-1);
+}
+inline uint16_t level(uint32_t brightness,uint16_t max=0xFFFF) {
     const uint32_t b=brightness>0xFFFF ? 0xFFFF : brightness;
-    return static_cast<uint16_t>(b<Floor ? Floor : b);
+    const uint32_t floor=max>>8 ? max>>8 : 1;
+    const uint32_t v=static_cast<uint32_t>((uint64_t(b)*max+0x7FFF)/0xFFFF);
+    return static_cast<uint16_t>(v<floor ? floor : v);
 }
 
 // control/mode: current 0x720/0x721 as just read from the panel.
-inline Plan plan(const Caps &caps,uint8_t control,uint8_t mode,uint32_t brightness) {
+inline Plan plan(const Caps &caps,uint8_t control,uint8_t mode,uint32_t brightness,uint16_t max=0) {
     Plan p;
     if(!caps.auxSet())return p;
+    if(!max)max=caps.wide() ? 0xFFFF : 0xFF;
     p.usable=true;
     if((mode&ModeMask)!=ModeDPCD){p.writeMode=true;p.mode=static_cast<uint8_t>((mode&~ModeMask)|ModeDPCD);}
     if(caps.auxEnable() && !(control&BacklightEnable)){p.writeControl=true;p.control=static_cast<uint8_t>(control|BacklightEnable);}
-    p.value=level(brightness);
+    p.value=level(brightness,max);
     if(caps.wide()){p.level[0]=static_cast<uint8_t>(p.value>>8);p.level[1]=static_cast<uint8_t>(p.value);p.levelLength=2;}
-    else {p.level[0]=static_cast<uint8_t>(p.value>>8);if(!p.level[0])p.level[0]=1;p.levelLength=1;}
+    else {p.level[0]=static_cast<uint8_t>(p.value);p.levelLength=1;}
     return p;
 }
 }
