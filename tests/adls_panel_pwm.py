@@ -44,6 +44,7 @@ struct XE {
  static bool display13PanelCapture(void*){assert(false);return false;}
  static uint32_t display13PanelBrightness(void*,uint32_t){assert(false);return 1;}
  static void display13PanelPWMEnable(void*){assert(false);}
+ static bool display13EDPAuxBrightness(void*,uint32_t,uint32_t&){return false;}
 
  bool adlsDisplaySelected=true,adlsPanelPWMReady=true,tglActive=true;XELP::PanelPWM adlsPanelPWM;
  XELP::VBT::Ports firmwarePorts;AlderLakeS::Wiring adlsWiring;
