@@ -5608,6 +5608,8 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
         processDSINativeTransactions(patcher,index,address,size) && processDSINativeAttributes(patcher,index,address,size));
     if(!adlnOutputWiring.dsi)
         IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlankReady",processDisplay13EDPBlank(patcher,index,address,size));
+    if(!adlnOutputWiring.dsi && checkKernelArgument("-wex-flip-trace"))
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipTraceReady",processDisplay13FlipTrace(patcher,index,address,size));
     dsiBootProbeReady=processDisplay13DSIBoot(patcher,index,address,size);
     dsiCacheHooksReady=processDisplay13DSICache(patcher,index,address,size);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBTopologyHooksReady",display13FBTopologyHooksReady);
@@ -8212,6 +8214,70 @@ bool XE::processDisplay13EDPAuxBL(KernelPatcher &patcher,size_t index,mach_vm_ad
  KernelPatcher::RouteRequest route {symbol,wrapADLSPanelBacklight,orgADLSPanelBacklight};
  const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
  return ready && orgADLSPanelBacklight;
+}
+// -wex-flip-trace (diagnostic): per flip transaction, how many hardware flips
+// (PIPE_FLIPCOUNT A) and which plane/cursor surface registers changed across
+// the donor's PerformFlipTransaction, plus the interval between transactions.
+// Published live in WEXFlipTrace:
+//  [0] version [1] transactions [2] hw flips inside [3] transactions with >1 flip
+//  [4] plane1 SURF changes [5] plane2 SURF changes [6] plane3 SURF changes
+//  [7] cursor BASE changes [8..13] interval histogram <4,<8.4,<12.5,<16.7,<25,>=25 ms
+//  [14] last result [15] max ns spent inside the call
+static uint64_t display13FlipTrace[16] {1};
+static IOSimpleLock *display13FlipTraceLock=nullptr;
+static uint64_t display13FlipTraceLast=0;
+static bool display13FlipTraceSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[16];
+ if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipTrace,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
+ else memcpy(q,display13FlipTrace,sizeof(q));
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+uint32_t XE::wrapDisplay13FlipTrace(IOService *fb,void *transaction,uint64_t arg,void *params) {
+ auto s=callbackXE;auto &c=display13FBPower;
+ volatile uint8_t *base=nullptr;
+ if(c.map && c.map->getLength()==0x1000000)base=reinterpret_cast<volatile uint8_t *>(c.map->getVirtualAddress());
+ constexpr uint32_t regs[] {0x70044,0x7019C,0x7029C,0x7039C,0x70084};
+ uint32_t before[5] {},after[5] {};
+ uint64_t t0;clock_get_uptime(&t0);absolutetime_to_nanoseconds(t0,&t0);
+ if(base)for(unsigned i=0;i<5;++i)before[i]=*reinterpret_cast<volatile uint32_t *>(base+regs[i]);
+ const auto r=FunctionCast(wrapDisplay13FlipTrace,s->orgDisplay13FlipTrace)(fb,transaction,arg,params);
+ if(base)for(unsigned i=0;i<5;++i)after[i]=*reinterpret_cast<volatile uint32_t *>(base+regs[i]);
+ uint64_t t1;clock_get_uptime(&t1);absolutetime_to_nanoseconds(t1,&t1);
+ if(display13FlipTraceLock) {
+  const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);
+  auto &q=display13FlipTrace;
+  ++q[1];
+  if(base) {
+   const uint32_t flips=after[0]-before[0];
+   q[2]+=flips;if(flips>1)++q[3];
+   for(unsigned i=1;i<5;++i)if(after[i]!=before[i])++q[3+i];
+  }
+  if(display13FlipTraceLast) {
+   const uint64_t d=t0-display13FlipTraceLast;
+   const unsigned b=d<4000000ULL?0:d<8400000ULL?1:d<12500000ULL?2:d<16700000ULL?3:d<25000000ULL?4:5;
+   ++q[8+b];
+  }
+  display13FlipTraceLast=t0;
+  q[14]=r;if(t1-t0>q[15])q[15]=t1-t0;
+  IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
+ }
+ return r;
+}
+bool XE::processDisplay13FlipTrace(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(!display13FramebufferRequested || size<0x2B620)return false;
+ const char *symbol="__ZN21AppleIntelFramebuffer22PerformFlipTransactionEP30IOAccelDisplayPipeTransaction2yP21FlipTransactionParams";
+ const uint8_t entry[17]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x48};
+ const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
+ if(fn!=address+0x2B602 || memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry)))return false;
+ if(!display13FlipTraceLock)display13FlipTraceLock=IOSimpleLockAlloc();
+ if(!display13FlipTraceLock || orgDisplay13FlipTrace)return false;
+ KernelPatcher::RouteRequest route {symbol,wrapDisplay13FlipTrace,orgDisplay13FlipTrace};
+ const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+ if(ready && orgDisplay13FlipTrace)if(auto live=OSSerializer::forTarget(nullptr,display13FlipTraceSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipTrace",live);live->release();
+ }
+ return ready && orgDisplay13FlipTrace;
 }
 bool XE::processDisplay13EDPBlank(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  if(!display13EDPBlankRequested() || !display13EDPKeep() || !display13FramebufferRequested || size<0x24E00)return false;

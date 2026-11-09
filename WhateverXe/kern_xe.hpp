@@ -261,6 +261,10 @@ private:
     static void display13EDPAuxBLApply(uint32_t brightness);
     static void display13EDPAuxBLWork(thread_call_param_t,thread_call_param_t);
     mach_vm_address_t orgDisplay13EDPPowerState {};
+    // -wex-flip-trace: flip transaction diagnostics.
+    bool processDisplay13FlipTrace(KernelPatcher &,size_t,mach_vm_address_t,size_t);
+    mach_vm_address_t orgDisplay13FlipTrace {};
+    static uint32_t wrapDisplay13FlipTrace(IOService *,void *,uint64_t,void *);
     static uint32_t wrapDisplay13EDPPowerState(IOService *,uint32_t);
     mach_vm_address_t orgDSITransaction[5] {};
     static int beginDSIFramebufferWriter(IOService *);
