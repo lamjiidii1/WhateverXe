@@ -37,6 +37,8 @@ Upstream 0.8.0 introduced automatic DP-alt Type-C port routing in `display13Fixe
   ```
   This restores `selected() == 0x01` (Combo A OLED), allowing link training, backlight profile attachment (`F16T4166`), and framebuffer modeset to complete cleanly.
 
+  **Trade-off:** because the speculative TC DP-alt routes are removed from the fixed wiring, external DisplayPort over USB-C is not offered while `-wex-adlp-edp` is active. USB data and USB-C charging are unaffected. Driving the internal panel is the priority for this variant; an external-sink-aware probe would be needed to keep both routes available. The VBT records for those TC ports are capability descriptions, not proof of a live DP-alt connection.
+
 ---
 
 ## 3. Improvements in WhateverXe 0.8.0-adlp
@@ -103,5 +105,7 @@ python3 tools/test.py
 ```
 
 Built artifacts will be placed in `build/`:
-- `build/Products/Release/WhateverXe.kext`
-- `build/Products/Release/AppleIntelTGLCompat.kext`
+- `build/WhateverXe.kext`
+- `build/AppleIntelTGLCompat.kext`
+
+`python3 tools/test.py` runs the standalone CPU suite; the `adlp-0.8.0` branch is expected to pass all 210 tests.

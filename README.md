@@ -13,7 +13,7 @@ Use the latest releases of [WhateverXe](https://github.com/b00t0x/WhateverXe/rel
 > 1. **Native Dynamic MMIO Resolution (`TGLMMIOStrongUCRouted = Yes`)**: Resolves kernel MMIO hooks dynamically in memory on macOS Sequoia 15.8.x without requiring hardcoded byte pattern matching or binary patching across macOS point updates.
 > 2. **VBT First-Child-Wins Parser**: Handles duplicate DDI 1 digital child declarations in Alder Lake VBTs that cause upstream to abort with `Status::Conflict`.
 > 3. **Fixed Combo A DP Output (`-wex-adlp-edp`)**: Admits internal eDP panels even when the firmware VBT sets `panel_type = 0xFF` (PnP ID select).
-> 4. **Display 13 Speculative Type-C Route Mask**: Fixes boot black screen (`FB0: Resources allocation failed (0xe00002bc)`) by clearing speculative DP-alt Type-C routes during internal panel link training.
+> 4. **Display 13 Speculative Type-C Route Mask**: Fixes boot black screen (`FB0: Resources allocation failed (0xe00002bc)`) by clearing speculative DP-alt Type-C routes during internal panel link training. External DisplayPort over USB-C is not offered in this mode; USB data and charging still work.
 > 5. **Backward Compatibility**: Fully compatible with WhateverXe Graphics 0.3.1 (`AppleIntelTGLCompat` 0.6.0 ABI).
 >
 > **Verified on real hardware:** HP Envy x360 13-bf0xxx (i7-1250U, Iris Xe GT2 `8086:46AA`, 2880×1800 OLED, macOS Sequoia 15.8.2 `24H232`).
