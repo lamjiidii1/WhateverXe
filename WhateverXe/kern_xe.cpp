@@ -4969,6 +4969,20 @@ static void adlnIRQRecord(uint64_t (&r)[32],unsigned event) {
 	r[29]=reinterpret_cast<uintptr_t>(c.lock);r[30]=c.handlers;r[31]=c.quiescing|(c.blockedPipes<<8)|(uint64_t(c.softwareHandlers)<<32);
 }
 
+// Live display interrupt counters for frame pacing diagnosis: uptime ns,
+// interrupts, then per pipe vblanks, flips and underruns (WEXFBIRQLive).
+static bool adlnIRQLiveSerialize(void *,void *,OSSerialize *serializer) {
+	uint64_t q[12] {1};auto &c=display13FBIRQ;auto &s=c.state;
+	uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,q+1);
+	if(c.lock) {
+		const auto saved=IOSimpleLockLockDisableInterrupt(c.lock);
+		q[2]=s.interrupts;
+		for(unsigned p=0;p<3;++p){q[3+p]=s.vblanks[p];q[6+p]=s.flips[p];q[9+p]=s.underruns[p];}
+		IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
+	}
+	auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+	const bool ok=data->serialize(serializer);data->release();return ok;
+}
 
 // These operations run under the display owner lock. AUX power qualification
 // needs the TC bank lock but never enters the native port or power callbacks.
@@ -8917,6 +8931,9 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
   that->setProperty("N97SharedFramebuffer",shared,sizeof(shared));
   if(auto power=OSSerializer::forTarget(that,adlnGTPowerSerialize)) {
    that->setProperty("N97GTPowerSample",power);power->release();
+  }
+  if(auto live=OSSerializer::forTarget(nullptr,adlnIRQLiveSerialize)) {
+   that->setProperty("WEXFBIRQLive",live);live->release();
   }
  }
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferStartAccepted",accepted);
