@@ -35,7 +35,7 @@ struct Inspection{Display13FBSysMem::Status status=Display13FBSysMem::Status::Co
 Inspection adlnInspectSysMem(IOService*,IOService*,unsigned,const PoolLayout&){assert(false);return {};}
 void adlnPublishMemory(const char*,unsigned,void*,unsigned,bool){}
 void adlnFault(bool &v,unsigned){v=true;}
-struct XE {bool display13FBMemoryHooksReady=true,dsiStopAttempted=false;struct {unsigned dsi=1;}adlnOutputWiring;
+struct XE {bool display13FBMemoryHooksReady=true,dsiStopAttempted=false,display13PanelDP=false;struct {unsigned dsi=1;}adlnOutputWiring;
  static IOMemoryDescriptor *wrapAlderLakeNAperture(IOService*,int);
 }*callbackXE;
 BODY

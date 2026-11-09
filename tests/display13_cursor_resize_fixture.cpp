@@ -39,7 +39,7 @@ unsigned display13FBExpectedOwner(void*){return 0;}
 bool dsiLogicalSurface(void*){return true;}
 void adlnFault(bool &f,unsigned){f=true;}
 struct XE {
- bool display13FBWatermarkHooksReady=true;void *adlnPlatform{};unsigned adlnOutputWiring=0;
+ bool display13FBWatermarkHooksReady=true,display13PanelDP=false;void *adlnPlatform{};unsigned adlnOutputWiring=0;
  uintptr_t adlnAdjustPixelClock{};
  static bool dsiSharedWriterStopped(void*,unsigned){return false;}
  static void adlnWMSetup(OSObject*,OSObject*,bool);

@@ -62,6 +62,8 @@ struct XE {
  static uint32_t wrapAlderLakeNPortState(OSObject *);
 } xe,*callbackXE=&xe;
 bool display13Offline=false;
+static uint64_t display13LinkState(){return 0;}
+static void display13PanelTrace(uint32_t,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0){}
 #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)
 FUNCTIONS
 void noReset(void *){assert(false && "DSI must not call native reset");}

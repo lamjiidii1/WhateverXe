@@ -18,6 +18,7 @@ struct State {
 FIELDS
  bool display13PanelPowerReady=false,display13PanelProbeReady=false;
  bool display13FBDPHooksReady=false,display13TCDPProbeReady=false,display13ClockOrderReady=true;
+ bool display13ComboDPReady=false;struct {unsigned dp=0;}adlnOutputWiring;
  struct Native {bool valid=true;bool complete()const{return valid;}}tglTCNativeFunctions;
  bool tglHDMIB=false,adlsDisplaySelected=false,tglTrainingLeaseRequested=true;
  struct {struct {bool valid=false;}panel;}firmwarePorts;

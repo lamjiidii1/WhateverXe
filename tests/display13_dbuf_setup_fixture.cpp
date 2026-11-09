@@ -58,7 +58,7 @@ TGLFBBinding::Readout adlnInspectPathBinding(IOService *fb,OSObject *path,void*,
 static IOService *dsiFB=nullptr;
 bool dsiModeTarget(IOService *fb){return fb && fb==dsiFB;}
 struct XE {
- bool display13FBDBUFHooksReady=true,display13FBWatermarkHooksReady=true;struct {unsigned dsi=0;operator unsigned()const{return 0x78;}}adlnOutputWiring;void *adlnPlatform{};
+ bool display13FBDBUFHooksReady=true,display13FBWatermarkHooksReady=true,display13PanelDP=false;struct {unsigned dsi=0;operator unsigned()const{return 0x78;}}adlnOutputWiring;void *adlnPlatform{};
  bool dsiStopAttempted=false;
  uintptr_t adlnAdjustPixelClock=0;
  static bool dsiSharedWriterStopped(IOService*,unsigned);

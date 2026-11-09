@@ -26,7 +26,8 @@ struct XE {
  XELP::Profile xeProfile=XELP::identify(0x46A68086,12,0x9A498086);
  XELP::VBT::Ports firmwarePorts;
  bool adlpDisplaySelected=true,adlsDisplaySelected=false,tglHDMIWiringApplied=false,tglTCWiringLoaded=false;
- bool display13PanelProbeReady=true,display13PanelPowerReady=true;
+ bool display13PanelProbeReady=true,display13PanelPowerReady=true,display13PanelDP=false;
+ uint32_t display13ComboDP()const{return display13PanelDP?1U:0U;}
  bool dsiResourcesReady=false,profileReady=true;
  bool prepareDSIFirmware(IOService *){return profileReady;}
  bool display13FBTopologyHooksReady=true,display13TCProbeReady=true,display13FBTCHooksReady=true;

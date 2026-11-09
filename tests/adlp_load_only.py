@@ -20,6 +20,7 @@ code=r'''
 #include "kern_xelp_os.hpp"
 #include "kern_alderlake_n.hpp"
 #include "kern_xelp_gt_resources.hpp"
+#include "kern_adlp_edp_readout.hpp"
 using mach_vm_address_t=uintptr_t;
 #define arrsize(a) (sizeof(a)/sizeof((a)[0]))
 #define SYSLOG(...) do{}while(0)
@@ -30,7 +31,7 @@ struct IORegistryEntry {
  void setProperty(const char *k,bool v){props[k]=v;}
 };std::map<std::string,bool> IORegistryEntry::props;
 struct Kext {size_t loadIndex;};Kext kextIntelTGLFb{1},kextIntelTGL{2};
-bool arg=true,readout=false;bool checkKernelArgument(const char *s){if(!strcmp(s,"-wex-adlp-readout"))return readout;assert(!strcmp(s,"-wex-adlp-load-only"));return arg;}
+bool arg=true,readout=false;bool checkKernelArgument(const char *s){if(!strcmp(s,"-wex-adlp-readout"))return readout;if(!strcmp(s,"-wex-adlp-readout-noaux"))return false;assert(!strcmp(s,"-wex-adlp-load-only"));return arg;}
 const char *version="Darwin Kernel Version 20.6.0: Thu Jul  6 22:12:47 PDT 2023; root:xnu-7195.141.49.702.12~1/RELEASE_X86_64";
 struct KernelPatcher {
  struct RouteRequest {const char *symbol;uintptr_t replacement;
@@ -65,6 +66,7 @@ struct DiagnosticGPU {
  Map *mapDeviceMemoryWithRegister(unsigned r,unsigned){assert(r==0x10);++maps;return &map;}
  void setProperty(const char *key,const void*,unsigned bytes){
   if(!strcmp(key,"ADLPScanoutBoot")){assert(bytes==sizeof(AlderLakeN::DisplayReadout));++snapshots;}
+  else if(!strcmp(key,"ADLPEDPBoot"))assert(bytes==sizeof(ADLPEDPReadout::Result));
  }
  void setProperty(const char*,uint32_t,unsigned){}
  void setProperty(const char *key,bool value){assert(!strcmp(key,"ADLPReadoutAllocationFailed"));allocationFailed=value;}
@@ -72,6 +74,7 @@ struct DiagnosticGPU {
 struct XE {
  bool adlpLoadOnly=false,adlpDisplaySelected=false;XELP::Profile xeProfile;unsigned initialized=0;
  DiagnosticGPU *physicalGPU=nullptr;
+ void xelpReadFirmware(DiagnosticGPU*){}
  void select(){SELECTION ++initialized;}
  void diagnose(){DIAGNOSTIC ++initialized;}
  bool processADLPLoadOnly(KernelPatcher &,size_t,mach_vm_address_t,size_t);

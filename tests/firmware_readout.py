@@ -15,8 +15,9 @@ code=r'''
 #include "kern_xelp_platform.hpp"
 #include "kern_vbt.hpp"
 #include "kern_dsi_math.hpp"
+#include "kern_display13_firmware.hpp"
 bool auditEnabled=false;
-bool checkKernelArgument(const char *arg){assert(!strcmp(arg,"-wex-dsi-audit"));return auditEnabled;}
+bool checkKernelArgument(const char *arg){if(!strcmp(arg,"-wex-adlp-edp"))return false;assert(!strcmp(arg,"-wex-dsi-audit"));return auditEnabled;}
 #define OSDynamicCast(type,ptr) (ptr)
 constexpr unsigned kIODirectionIn=1,kIOMapReadOnly=2;
 struct OSData {
@@ -32,10 +33,11 @@ struct IOMemoryDescriptor {
 struct IOPCIDevice {unsigned reads=0,publications=0;uint32_t configRead32(unsigned off){assert(off==0xfc);++reads;return 0;}
  std::map<std::string,OSData> properties;
  OSData *getProperty(const char *key){auto i=properties.find(key);return i==properties.end()?nullptr:&i->second;}
- void setProperty(const char*,uint32_t,unsigned){++publications;}void setProperty(const char*,const void*,unsigned){++publications;}
+ void setProperty(const char*,uint32_t,unsigned){++publications;}
+ void setProperty(const char *key,const void *p,unsigned n){++publications;properties[key].bytes.assign((const uint8_t*)p,(const uint8_t*)p+n);}
  void setProperty(const char *key,OSData *d){++publications;properties[key]=*d;}
 };
-struct XE {XELP::Profile xeProfile;XELP::VBT::Ports firmwarePorts;void xelpReadFirmware(IOPCIDevice*);};
+struct XE {XELP::Profile xeProfile;XELP::VBT::Ports firmwarePorts;bool display13PanelDP=false;void xelpReadFirmware(IOPCIDevice*);};
 BODY
 int main(int argc,char **argv){
  for(unsigned kind=0;kind<5;++kind){XE x;IOPCIDevice pci;

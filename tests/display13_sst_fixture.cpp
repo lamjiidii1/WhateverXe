@@ -56,6 +56,8 @@ struct Display13FBSSTIO {
  void write(uint32_t r,uint32_t v){assert(locked);map->write(r,v);}
 };
 bool adlnWriterMappingBound(){return bound;}
+static uint64_t display13LinkState(){return 0;}
+static void display13PanelTrace(uint32_t,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0){}
 uintptr_t display13FBExpectedOwner(void*){return 0;}
 struct XE {
  XELP::VBT::Ports firmwarePorts;bool tglSinkFramingReady=true;
@@ -68,7 +70,7 @@ struct XE {
  uintptr_t orgDisplay13EnablePort=0,orgDisplay13DisablePort=0;
  static bool display13MainLinkAUX(void*,bool,bool=false);
  static uint32_t wrapDisplay13EnablePort(void*);static uint32_t wrapDisplay13DisablePort(void*);
- static uint8_t *display13SSTPort(void*);static bool display13HDMIPort(void*);
+ static uint8_t *display13SSTPort(void *port,bool unprobed=false);static bool display13HDMIPort(void*);
  static uint32_t wrapDisplay13TCSignal(void*,uint32_t,uint32_t,void*){assert(false);return 1;}
  static uint32_t wrapDisplay13SignalLevels(void*,uint32_t,uint32_t,void*);
  static uint32_t wrapDisplay13TrainingPattern(void*,uint32_t);

@@ -75,6 +75,9 @@ using IOService=IOPCIDevice;using IOReturn=int;using IOFramebuffer=IOPCIDevice;
 constexpr uint32_t kIOWindowServerActiveAttribute=1,kIOWSAA_StateMask=15,kIOWSAA_Accelerated=1,kIOWSAA_Unaccelerated=0;
 constexpr IOReturn kIOReturnSuccess=0,kIOReturnNotReady=-1;
 #define FunctionCast(fn,addr) reinterpret_cast<decltype(&fn)>(addr)
+static bool checkKernelArgument(const char *){return false;}
+static void dumpPanelACPITables(){}
+static void xePmInstall(KernelPatcher &) {}
 struct XeHost {
  static XeHost *callbackHost;
  HOST_STATE
@@ -88,7 +91,7 @@ struct XeHost {
  static uint32_t pendingSleepDisplays(void*);
  uintptr_t orgWSAAAttribute=0;
  static IOReturn wrapWSAAAttribute(IOFramebuffer*,uint32_t,uint32_t);
- bool backlightEnabled=false;enum {FB_DETECT,FB_RESET,FB_COPY,FB_ZEROFILL,FB_NONE,FB_TOTAL};uint32_t resetFramebuffer=FB_NONE;
+ bool backlightEnabled=false,backlightPanelEDP=false;enum {FB_DETECT,FB_RESET,FB_COPY,FB_ZEROFILL,FB_NONE,FB_TOTAL};uint32_t resetFramebuffer=FB_NONE;
  IOPCIDevice *backlightGPU=nullptr;
  struct vc_info{};vc_info consoleVinfo;bool gotConsoleVinfo=false;
  struct XE {
