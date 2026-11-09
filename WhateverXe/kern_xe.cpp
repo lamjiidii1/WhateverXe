@@ -8290,6 +8290,63 @@ static bool display13FlipVBlankSerialize(void *,void *,OSSerialize *serializer) 
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
+// WEXFlipQueue: the trigger packets armUpdate flushes during a flip, and the
+// optional -wex-flip-dedupe experiment that drops an earlier PLANE_SURF_1_A
+// packet when a later one in the same queue has the same value and flags.
+//  [0] version [1] armUpdate calls inside a flip [2] paths flushed
+//  [3] last packet count [4] max packet count [5] SURF packets seen
+//  [6] SURF packets removed [7] dedupe enabled
+//  [8..31] last snapshot: 12 packets x {reg<<32|value, flags}
+static uint64_t display13FlipQueue[32] {1};
+static bool display13FlipDedupe=false;
+static bool display13FlipQueueSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[32];
+ if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipQueue,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
+ else memcpy(q,display13FlipQueue,sizeof(q));
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// Called from the armUpdate route before the donor flushes, with the
+// framebuffer mutex the donor already holds for the flip.
+static void display13FlipArmObserve(IOService *fb) {
+ if(!display13FlipTraceLock || !fb || !__atomic_load_n(&display13FlipDepth,__ATOMIC_RELAXED))return;
+ if(fb->getMetaClass()->getClassSize()<0x4B90)return;
+ auto base=reinterpret_cast<uint8_t *>(fb);
+ const bool single=*reinterpret_cast<int32_t *>(base+0x3FD8)==-1;
+ const uint32_t paths=*reinterpret_cast<uint32_t *>(base+(single ? 0x49E8 : 0x4A00));
+ if(paths>3)return;
+ const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);
+ auto &q=display13FlipQueue;++q[1];q[7]=display13FlipDedupe;
+ for(uint32_t i=0;i<paths;++i) {
+  auto path=*reinterpret_cast<OSObject **>(base+(single ? 0x49F0 : 0x4A08)+8*i);
+  if(!path || path->getMetaClass()->getClassSize()<0x3730)continue;
+  auto pb=reinterpret_cast<uint8_t *>(path);
+  auto &count=*reinterpret_cast<uint32_t *>(pb+0x35F0);
+  auto packet=reinterpret_cast<uint32_t *>(pb+0x32F0); // {reg,value,flags} x 64
+  uint32_t n=count;if(n>64)continue;
+  ++q[2];q[3]=n;if(n>q[4])q[4]=n;
+  for(uint32_t k=0;k<n;++k)if(packet[3*k]==0x7019C)++q[5];
+  if(i==0)for(uint32_t k=0;k<12;++k) {
+   q[8+2*k]=k<n ? (uint64_t(packet[3*k])<<32|packet[3*k+1]) : 0;q[9+2*k]=k<n ? packet[3*k+2] : 0;
+  }
+  if(!display13FlipDedupe)continue;
+  // Keep the slot after the last packet as it was: the donor's flush reads
+  // the flags at index count after every write.
+  uint32_t stale[3]={0,0,0};const bool hasStale=n<64;
+  if(hasStale)memcpy(stale,packet+3*n,sizeof(stale));
+  uint32_t out=0;
+  for(uint32_t k=0;k<n;++k) {
+   bool drop=false;
+   if(packet[3*k]==0x7019C)for(uint32_t j=k+1;j<n;++j)
+    if(packet[3*j]==0x7019C) {drop=packet[3*j+1]==packet[3*k+1] && packet[3*j+2]==packet[3*k+2];break;}
+   if(drop) {++q[6];continue;}
+   if(out!=k)memmove(packet+3*out,packet+3*k,3*sizeof(uint32_t));
+   ++out;
+  }
+  if(out!=n) {count=out;if(hasStale)memcpy(packet+3*out,stale,sizeof(stale));}
+ }
+ IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
+}
 static bool display13FlipTraceSerialize(void *,void *,OSSerialize *serializer) {
  uint64_t q[16];
  if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipTrace,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
@@ -8364,6 +8421,7 @@ bool XE::processDisplay13FlipTrace(KernelPatcher &patcher,size_t index,mach_vm_a
  if(!display13FlipTraceLock)display13FlipTraceLock=IOSimpleLockAlloc();
  if(!display13FlipTraceLock || orgDisplay13FlipTrace)return false;
  display13FlipDonorBase=address;display13FlipDonorSize=size;
+ display13FlipDedupe=checkKernelArgument("-wex-flip-dedupe");
  KernelPatcher::RouteRequest route {symbol,wrapDisplay13FlipTrace,orgDisplay13FlipTrace};
  const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
  if(ready && orgDisplay13FlipTrace)if(auto live=OSSerializer::forTarget(nullptr,display13FlipTraceSerialize)) {
@@ -8384,6 +8442,9 @@ bool XE::processDisplay13FlipTrace(KernelPatcher &patcher,size_t index,mach_vm_a
  }
  if(ready && orgDisplay13FlipTrace)if(auto sf=OSSerializer::forTarget(nullptr,display13FlipSurfSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipSurf",sf);sf->release();
+ }
+ if(ready && orgDisplay13FlipTrace)if(auto fq=OSSerializer::forTarget(nullptr,display13FlipQueueSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipQueue",fq);fq->release();
  }
  if(ready && orgDisplay13FlipTrace)if(auto wm=OSSerializer::forTarget(nullptr,display13FlipWMSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipWM",wm);wm->release();
@@ -10492,6 +10553,7 @@ static bool adlnObserveScanoutPixels(unsigned pipe,uint64_t (&q)[88]) {
 }
 
 void XE::wrapDisplay13WMArmUpdate(IOService *fb) {
+    display13FlipArmObserve(fb);
     if(!callbackXE->adlnOutputWiring.dsi){display13WMArmUpdate(fb);return;}
     if(!fb || fb->getMetaClass()->getClassSize()<0x4B90)return;
     {

@@ -154,6 +154,7 @@
   "-wex-mtl-poshfix": [],
   "-wex-pm": [],
   "-wex-flip-trace": [],
+  "-wex-flip-dedupe": [],
   "-wex-edp-auxbl": [],
   "-wex-edp-auxbl-intel": [],
   "-wex-edp-auxbl-final": [],
