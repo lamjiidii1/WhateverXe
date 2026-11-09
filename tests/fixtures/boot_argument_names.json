@@ -1,4 +1,12 @@
 {
+  "-wex-dsi-audit": [],
+  "-wex-dsi-60hz": [],
+  "-wex-dsi-adopt": [],
+  "-wex-dsi-panel-only": [],
+  "-wex-dsi-command-test": [],
+  "-wex-dsi-panel-test": [],
+  "-wex-dsi-host-test": [],
+  "-wex-dsi-stop-test": [],
   "-wex-adln-config-stage": [
     "-adlnconfigstage",
     "-n97configstage"
@@ -137,13 +145,8 @@
   "-wex-noaccel": [],
   "-wex-display-trace": [],
   "-wex-adlp-readout": [],
-  "-wex-adlp-readout-noaux": [],
-  "-wex-adlp-edp": [],
-  "-wex-no-multicontext": [],
-  "-wex-pm": [],
-  "-wex-reset-restore": [],
-  "-wex-reset-trace": [],
-  "-wex-scanout-coherent": [],
   "-wex-adlp-load-only": [],
-  "-wex-display13-offline": []
+  "-wex-display13-offline": [],
+  "-wex-dsi-hdmi-test": [],
+  "-wex-dsi-power-test": []
 }

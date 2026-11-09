@@ -59,9 +59,9 @@ int main() {
     // Wiring: Combo A fixed DP is admitted only with the explicit comboDP mask.
     Display13OutputWiring w;w.valid=true;w.dp=1;
     assert(w.described() && !Display13FBTopology::supportedWiring(w,true) &&
-        Display13FBTopology::supportedWiring(w,true,1));
-    assert(!Display13FBTopology::supportedWiring(w,true,2)); // Combo B is not part of this route.
-    auto b=w;b.dp=2;assert(!Display13FBTopology::supportedWiring(b,true,1));
+        Display13FBTopology::supportedWiring(w,true,false,1));
+    assert(!Display13FBTopology::supportedWiring(w,true,false,2)); // Combo B is not part of this route.
+    auto b=w;b.dp=2;assert(!Display13FBTopology::supportedWiring(b,true,false,1));
     // The firmware DP GOP on DDI A selects the boot connector only via DP.
     assert(Display13FBTopology::bootDDI(w,0x8A010106,true)==0);
     assert(Display13FBTopology::bootDDI(w,0x8A010106,false)==UINT32_MAX);
@@ -94,7 +94,7 @@ int main() {
         assert(fixed.valid && !fixed.hdmi && fixed.dp==fixed.typeC); // TC children are Type-C capable, not fixed
         fixed.dp|=display13PanelDP(real);
         fixed.dp&=~0x78U;fixed.typeC=0;
-        assert(Display13FBTopology::supportedWiring(fixed,true,1) && fixed.selected()==1);
+        assert(Display13FBTopology::supportedWiring(fixed,true,false,1) && fixed.selected()==1);
         assert(parse(raw.data(),raw.size(),Family::AlderLakeP).status==Status::Conflict);
     } else assert(!"missing VBT fixture");
     puts("adlp_panel_dp ok");

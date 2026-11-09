@@ -23,8 +23,9 @@ inline bool supportedWiring(const Display13OutputWiring &w,bool fixedTC,bool dsi
     // comboDP admits an explicitly enabled fixed Combo DP route (Combo A only).
     return (!w.dsi || dsiAdoption) && !(comboDP&~1U) && !(w.dp&~(0x78U|comboDP)) && w.described() && !(w.selected()&~(fixedTC ? Display13OutputWiring::Physical : 3U));
 }
-inline bool supportedWiring(const Display13OutputWiring &w,bool fixedTC=false,uint32_t comboDP=0) {
-    return supportedWiring(w,fixedTC,false,comboDP);
+// Keep the released three-argument contract (fixedTC, dsiAdoption) intact.
+inline bool supportedWiring(const Display13OutputWiring &w,bool fixedTC=false,bool dsiAdoption=false) {
+    return supportedWiring(w,fixedTC,dsiAdoption,0);
 }
 // A TC route uses the same validated handoff regardless of the GT family.
 // Keep the established Combo-only ADL-N startup ordering unchanged.
