@@ -4970,15 +4970,22 @@ static void adlnIRQRecord(uint64_t (&r)[32],unsigned event) {
 }
 
 // Live display interrupt counters for frame pacing diagnosis: uptime ns,
-// interrupts, then per pipe vblanks, flips and underruns (WEXFBIRQLive).
+// interrupts, then per pipe vblanks, flips and underruns, then pipe A hardware
+// frame and flip counters (WEXFBIRQLive v2).
 static bool adlnIRQLiveSerialize(void *,void *,OSSerialize *serializer) {
-	uint64_t q[12] {1};auto &c=display13FBIRQ;auto &s=c.state;
+	uint64_t q[14] {2};auto &c=display13FBIRQ;auto &s=c.state;
 	uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,q+1);
 	if(c.lock) {
 		const auto saved=IOSimpleLockLockDisableInterrupt(c.lock);
 		q[2]=s.interrupts;
 		for(unsigned p=0;p<3;++p){q[3+p]=s.vblanks[p];q[6+p]=s.flips[p];q[9+p]=s.underruns[p];}
 		IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
+	}
+	// Hardware frame and flip counters of pipe A (PIPE_FRMCOUNT/PIPE_FLIPCOUNT),
+	// which count every refresh whether or not vblank interrupts are enabled.
+	if(c.base) {
+		Display13FBIRQIO io {c.base};
+		if(Display13FBIRQ::powered(io.read(Display13FBIRQ::Driver),0)){q[12]=io.read(0x70040);q[13]=io.read(0x70044);}
 	}
 	auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
 	const bool ok=data->serialize(serializer);data->release();return ok;
