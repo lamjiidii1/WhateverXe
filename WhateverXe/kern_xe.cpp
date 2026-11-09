@@ -8226,6 +8226,22 @@ bool XE::processDisplay13EDPAuxBL(KernelPatcher &patcher,size_t index,mach_vm_ad
 static uint64_t display13FlipTrace[16] {1};
 static IOSimpleLock *display13FlipTraceLock=nullptr;
 static uint64_t display13FlipTraceLast=0;
+// WEXFlipWM: who adds the second flip? Counts WEX's own watermark trigger path
+// (adlnWMEnable, its queued surface trigger and armUpdate), in total and while a
+// PerformFlipTransaction is running.
+//  [0] version [1] wmEnable calls [2] ...inside a flip [3] queued triggers
+//  [4] ...inside a flip [5] armUpdate calls [6] ...inside a flip
+static uint64_t display13FlipWM[8] {1};
+static volatile uint32_t display13FlipDepth=0;
+static inline void display13FlipWMBump(unsigned total) {
+ __atomic_add_fetch(&display13FlipWM[total],1,__ATOMIC_RELAXED);
+ if(__atomic_load_n(&display13FlipDepth,__ATOMIC_RELAXED))__atomic_add_fetch(&display13FlipWM[total+1],1,__ATOMIC_RELAXED);
+}
+static bool display13FlipWMSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[8];for(unsigned i=0;i<8;++i)q[i]=__atomic_load_n(&display13FlipWM[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 static bool display13FlipTraceSerialize(void *,void *,OSSerialize *serializer) {
  uint64_t q[16];
  if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipTrace,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
@@ -8241,7 +8257,9 @@ uint32_t XE::wrapDisplay13FlipTrace(IOService *fb,void *transaction,uint64_t arg
  uint32_t before[5] {},after[5] {};
  uint64_t t0;clock_get_uptime(&t0);absolutetime_to_nanoseconds(t0,&t0);
  if(base)for(unsigned i=0;i<5;++i)before[i]=*reinterpret_cast<volatile uint32_t *>(base+regs[i]);
+ __atomic_add_fetch(&display13FlipDepth,1,__ATOMIC_RELAXED);
  const auto r=FunctionCast(wrapDisplay13FlipTrace,s->orgDisplay13FlipTrace)(fb,transaction,arg,params);
+ __atomic_sub_fetch(&display13FlipDepth,1,__ATOMIC_RELAXED);
  if(base)for(unsigned i=0;i<5;++i)after[i]=*reinterpret_cast<volatile uint32_t *>(base+regs[i]);
  uint64_t t1;clock_get_uptime(&t1);absolutetime_to_nanoseconds(t1,&t1);
  if(display13FlipTraceLock) {
@@ -8276,6 +8294,9 @@ bool XE::processDisplay13FlipTrace(KernelPatcher &patcher,size_t index,mach_vm_a
  const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
  if(ready && orgDisplay13FlipTrace)if(auto live=OSSerializer::forTarget(nullptr,display13FlipTraceSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipTrace",live);live->release();
+ }
+ if(ready && orgDisplay13FlipTrace)if(auto wm=OSSerializer::forTarget(nullptr,display13FlipWMSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipWM",wm);wm->release();
  }
  return ready && orgDisplay13FlipTrace;
 }
@@ -10172,6 +10193,7 @@ void XE::wrapAlderLakeNDisableDisplay(IOService *controller,IOService *fb,OSObje
 }
 
 void XE::adlnWMEnable(OSObject *plane,bool arm,bool cursor) {
+ display13FlipWMBump(1);
 	auto &c=display13FBPower;if(!c.lock || !plane || plane->getMetaClass()->getClassSize()<0x1C8)return;
 	auto fb=Display13FBMemory::field<IOService *>(plane,0x68);
 	if(!fb || fb->getMetaClass()->getClassSize()<0x4B90)return;
@@ -10259,12 +10281,13 @@ void XE::adlnWMEnable(OSObject *plane,bool arm,bool cursor) {
 		if(!queued)r.status=Display13WM::Status::Input;
 	}
 	IORecursiveLockUnlock(mutex);
-	if(queued && arm)reinterpret_cast<void (*)(void *)>(callbackXE->adlnWMArmUpdate)(fb);
+	if(queued && arm){display13FlipWMBump(5);reinterpret_cast<void (*)(void *)>(callbackXE->adlnWMArmUpdate)(fb);}
 	IOLockLock(c.lock);c.pipe[pipe].wmProgramming=false;c.pipe[pipe].wmProgram[cursor ? 1 : 0]=r;
 	if(r.status!=Display13WM::Status::Complete)adlnFault(c.watermarkFaulted,__LINE__);
 	IOLockUnlock(c.lock);record[2]=static_cast<uint32_t>(r.status);
 	// Trigger queued is not a VBlank/flip/DSB ACK. No DBUF retirement or
 	// watermarkClockHz qualification occurs here.
+	if(queued)display13FlipWMBump(3);
 	record[10]=queued;record[11]=queued && arm;record[12]=surface;record[13]=queueIndex;record[14]=pipe;
 	IORegistryEntry::getRegistryRoot()->setProperty(cursor ? "N97FBCursorWMProgram" : "N97FBPrimaryWMProgram",record,sizeof(record));
 	auto root=IORegistryEntry::getRegistryRoot();
