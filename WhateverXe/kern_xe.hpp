@@ -265,6 +265,8 @@ private:
     bool processDisplay13FlipTrace(KernelPatcher &,size_t,mach_vm_address_t,size_t);
     mach_vm_address_t orgDisplay13FlipTrace {};
     static uint32_t wrapDisplay13FlipTrace(IOService *,void *,uint64_t,void *);
+    mach_vm_address_t orgDisplay13FlipVBlank {};
+    static uint64_t wrapDisplay13FlipVBlank(void *,void *,uint32_t);
     static uint32_t wrapDisplay13EDPPowerState(IOService *,uint32_t);
     mach_vm_address_t orgDSITransaction[5] {};
     static int beginDSIFramebufferWriter(IOService *);

@@ -8277,6 +8277,19 @@ static bool display13FlipSurfSerialize(void *,void *,OSSerialize *serializer) {
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
+// WEXFlipVBlank: hwWaitForVBlank calls, and how long they block, while a
+// PerformFlipTransaction runs.
+//  [0] version [1] calls inside a flip [2] total ns [3] max ns
+//  [4..8] duration <1, <4, <8.4, <16.7, >=16.7 ms [9] calls outside a flip
+//  [10..15] 3 caller slots {donor return offset, count}
+static uint64_t display13FlipVBlank[16] {1};
+static bool display13FlipVBlankSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[16];
+ if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipVBlank,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
+ else memcpy(q,display13FlipVBlank,sizeof(q));
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 static bool display13FlipTraceSerialize(void *,void *,OSSerialize *serializer) {
  uint64_t q[16];
  if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipTrace,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
@@ -8317,6 +8330,31 @@ uint32_t XE::wrapDisplay13FlipTrace(IOService *fb,void *transaction,uint64_t arg
  }
  return r;
 }
+uint64_t XE::wrapDisplay13FlipVBlank(void *controller,void *fb,uint32_t count) {
+ const bool inside=__atomic_load_n(&display13FlipDepth,__ATOMIC_RELAXED)!=0;
+ auto ra=reinterpret_cast<uint64_t>(__builtin_return_address(0));
+ const auto base=display13FlipDonorBase;
+ ra=(base && ra>=base && ra-base<display13FlipDonorSize) ? ra-base : (ra|(1ULL<<63));
+ uint64_t t0;clock_get_uptime(&t0);absolutetime_to_nanoseconds(t0,&t0);
+ const auto r=FunctionCast(wrapDisplay13FlipVBlank,callbackXE->orgDisplay13FlipVBlank)(controller,fb,count);
+ uint64_t t1;clock_get_uptime(&t1);absolutetime_to_nanoseconds(t1,&t1);
+ if(display13FlipTraceLock) {
+  const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);
+  auto &q=display13FlipVBlank;
+  if(inside) {
+   const uint64_t d=t1-t0;
+   ++q[1];q[2]+=d;if(d>q[3])q[3]=d;
+   ++q[4+(d<1000000ULL?0:d<4000000ULL?1:d<8400000ULL?2:d<16700000ULL?3:4)];
+   for(unsigned i=0;i<3;++i) {
+    auto slot=q+10+2*i;
+    if(slot[1] && slot[0]==ra) {++slot[1];break;}
+    if(!slot[1]) {slot[0]=ra;slot[1]=1;break;}
+   }
+  } else ++q[9];
+  IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
+ }
+ return r;
+}
 bool XE::processDisplay13FlipTrace(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  if(!display13FramebufferRequested || size<0x2B620)return false;
  const char *symbol="__ZN21AppleIntelFramebuffer22PerformFlipTransactionEP30IOAccelDisplayPipeTransaction2yP21FlipTransactionParams";
@@ -8330,6 +8368,19 @@ bool XE::processDisplay13FlipTrace(KernelPatcher &patcher,size_t index,mach_vm_a
  const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
  if(ready && orgDisplay13FlipTrace)if(auto live=OSSerializer::forTarget(nullptr,display13FlipTraceSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipTrace",live);live->release();
+ }
+ if(ready && orgDisplay13FlipTrace) {
+  const char *vsym="__ZN31AppleIntelFramebufferController15hwWaitForVBlankEP21AppleIntelFramebufferj";
+  const uint8_t ventry[17]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x18};
+  const auto vfn=patcher.solveSymbol<mach_vm_address_t>(index,vsym,address,size);patcher.clearError();
+  bool vready=false;
+  if(vfn==address+0x4AE1E && !memcmp(reinterpret_cast<void *>(vfn),ventry,sizeof(ventry)) && !orgDisplay13FlipVBlank) {
+   KernelPatcher::RouteRequest vroute {vsym,wrapDisplay13FlipVBlank,orgDisplay13FlipVBlank};
+   vready=patcher.routeMultiple(index,&vroute,1,address,size) && orgDisplay13FlipVBlank;patcher.clearError();
+  }
+  if(vready)if(auto vb=OSSerializer::forTarget(nullptr,display13FlipVBlankSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipVBlank",vb);vb->release();
+  }
  }
  if(ready && orgDisplay13FlipTrace)if(auto sf=OSSerializer::forTarget(nullptr,display13FlipSurfSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipSurf",sf);sf->release();
