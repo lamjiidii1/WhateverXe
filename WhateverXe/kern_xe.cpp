@@ -8242,6 +8242,41 @@ static bool display13FlipWMSerialize(void *,void *,OSSerialize *serializer) {
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
+// WEXFlipSurf: who writes PLANE_SURF_1_A (0x7019C) during a flip transaction?
+// Sampled in the existing WriteRegister32 route; three return addresses from
+// the frame-pointer chain, as donor offsets (bit 63 = outside the donor).
+//  [0] version [1] SURF writes inside a flip [2] slots used
+//  [3..34] 8 slots x {count, ra0, ra1, ra2}
+static uint64_t display13FlipDonorBase=0,display13FlipDonorSize=0;
+static uint64_t display13FlipSurf[35] {1};
+static void display13FlipSurfSample(const uint64_t *fp) {
+ uint64_t ra[3] {};
+ const uint64_t *f=fp;
+ for(unsigned i=0;i<3 && f;++i) {
+  ra[i]=f[1];
+  const auto here=reinterpret_cast<uintptr_t>(f),next=static_cast<uintptr_t>(f[0]);
+  if(next<=here || next-here>0x4000 || (next&7))break;
+  f=reinterpret_cast<const uint64_t *>(next);
+ }
+ const auto base=display13FlipDonorBase,size=display13FlipDonorSize;
+ for(auto &r:ra)if(r)r=(base && r>=base && r-base<size) ? r-base : (r|(1ULL<<63));
+ if(!display13FlipTraceLock)return;
+ const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);
+ auto &q=display13FlipSurf;++q[1];
+ for(unsigned i=0;i<8;++i) {
+  auto slot=q+3+4*i;
+  if(slot[0] && slot[1]==ra[0] && slot[2]==ra[1] && slot[3]==ra[2]) {++slot[0];break;}
+  if(!slot[0]) {slot[0]=1;slot[1]=ra[0];slot[2]=ra[1];slot[3]=ra[2];q[2]=i+1;break;}
+ }
+ IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
+}
+static bool display13FlipSurfSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[35];
+ if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipSurf,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
+ else memcpy(q,display13FlipSurf,sizeof(q));
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 static bool display13FlipTraceSerialize(void *,void *,OSSerialize *serializer) {
  uint64_t q[16];
  if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipTrace,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
@@ -8290,10 +8325,14 @@ bool XE::processDisplay13FlipTrace(KernelPatcher &patcher,size_t index,mach_vm_a
  if(fn!=address+0x2B602 || memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry)))return false;
  if(!display13FlipTraceLock)display13FlipTraceLock=IOSimpleLockAlloc();
  if(!display13FlipTraceLock || orgDisplay13FlipTrace)return false;
+ display13FlipDonorBase=address;display13FlipDonorSize=size;
  KernelPatcher::RouteRequest route {symbol,wrapDisplay13FlipTrace,orgDisplay13FlipTrace};
  const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
  if(ready && orgDisplay13FlipTrace)if(auto live=OSSerializer::forTarget(nullptr,display13FlipTraceSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipTrace",live);live->release();
+ }
+ if(ready && orgDisplay13FlipTrace)if(auto sf=OSSerializer::forTarget(nullptr,display13FlipSurfSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipSurf",sf);sf->release();
  }
  if(ready && orgDisplay13FlipTrace)if(auto wm=OSSerializer::forTarget(nullptr,display13FlipWMSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipWM",wm);wm->release();
@@ -8605,6 +8644,8 @@ void XE::wrapAlderLakeNGamma10(void *path,void *transaction,uint32_t control) {
 }
 
 void XE::wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value) {
+    if(reg==0x7019C && __atomic_load_n(&display13FlipDepth,__ATOMIC_RELAXED))
+        display13FlipSurfSample(reinterpret_cast<const uint64_t *>(__builtin_frame_address(0)));
     if(display13DeferClock(access,reg,value,reinterpret_cast<uintptr_t>(__builtin_return_address(0))))return;
     // DISPLAY13_COMBO_FRACTION: qualified nominal writer, physical reference,
     // retained controller/manager. No MMIO or other port's PLL inference.
