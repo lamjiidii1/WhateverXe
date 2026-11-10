@@ -36,6 +36,7 @@
 
 #include "kern_dvmt.hpp"
 #include <Headers/kern_patcher.hpp>
+#include <kern/thread_call.h>
 #include <Headers/kern_devinfo.hpp>
 #include <Headers/kern_cpu.hpp>
 #include <Headers/kern_disasm.hpp>
@@ -216,6 +217,7 @@ private:
  static uint32_t wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag);
  static uint32_t wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,bool flag);
  mach_vm_address_t orgDisplay13TrainingPattern {},orgDisplay13SignalLevels {};
+ mach_vm_address_t orgDisplay13RegsNeedUpdate {};
  mach_vm_address_t orgDisplay13EnablePort {},orgDisplay13DisablePort {};
  static bool display13MainLinkAUX(void *port,bool acquire,bool stopping=false);
  static uint32_t wrapDisplay13EnablePort(void *port);
@@ -233,6 +235,7 @@ private:
  static bool display13DeferClock(void *access,uint64_t reg,uint32_t value,uintptr_t caller);
 
  static uint8_t *display13SSTPort(void *port,bool unprobed=false);
+ static uint8_t *display13PanelBootPort(void *port);
  static void display13SSTPortRecord(void *port);
  static void display13PanelWriteRecord(uint32_t reg,uint32_t original,uint32_t value,uintptr_t caller);
  static void display13AUXFailRecord(void *port,uint32_t result,uint32_t command);
@@ -256,6 +259,7 @@ private:
  static uint32_t wrapPanelGetOnlineInfo(IOService *fb,void *path,uint8_t *online,uint8_t *info);
  static bool display13HDMIPort(void *port);
  static uint32_t wrapDisplay13TrainingPattern(void *path,uint32_t pattern);
+ static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);
  static uint32_t wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig);
 	mach_vm_address_t xelpProviderProbe {},xelpProviderConfigureProbe {};
  bool display13DPAltProbeReady {},display13DPProbeReady {},display13TCProbeReady {},display13TCDPProbeReady {},display13FBDPHooksReady {};
@@ -297,6 +301,24 @@ private:
     static uint32_t wrapDSISetAttribute(IOService *,uint32_t,uintptr_t);
     static uint32_t wrapDSISetConnectionAttribute(IOService *,int32_t,uint32_t,uintptr_t);
     static uint32_t wrapDisplay13SetPowerState(IOService *,uint32_t);
+    static uint32_t wrapDSISetPowerState(IOService *,uint32_t);
+    // -wex-edp-blank: display sleep on a kept firmware eDP link (kern_display13_edp_blank).
+    bool processDisplay13EDPBlank(KernelPatcher &,size_t,mach_vm_address_t,size_t);
+    // -wex-edp-auxbl: VESA AUX brightness of a kept type-5 eDP panel (kern_display13_edp_auxbl).
+    bool processDisplay13EDPAuxBL(KernelPatcher &,size_t,mach_vm_address_t,size_t);
+    static bool display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t &result);
+    static void display13EDPAuxBLApply(uint32_t brightness);
+    static void display13EDPAuxBLWork(thread_call_param_t,thread_call_param_t);
+    mach_vm_address_t orgDisplay13EDPPowerState {};
+    // -wex-flip-trace: flip transaction diagnostics.
+    bool processDisplay13FlipTrace(KernelPatcher &,size_t,mach_vm_address_t,size_t);
+    mach_vm_address_t orgDisplay13FlipTrace {};
+    static uint32_t wrapDisplay13FlipTrace(IOService *,void *,uint64_t,void *);
+    mach_vm_address_t orgDisplay13FlipVBlank {};
+    static uint64_t wrapDisplay13FlipVBlank(void *,void *,uint32_t);
+    mach_vm_address_t orgDisplay13FlipVBL {};
+    static uint64_t wrapDisplay13FlipVBL(void *,uint32_t);
+    static uint32_t wrapDisplay13EDPPowerState(IOService *,uint32_t);
     mach_vm_address_t orgDSITransaction[5] {};
     static int beginDSIFramebufferWriter(IOService *);
     static uint32_t wrapDSIFlipTransaction(IOService *,void *,uint64_t,void *);

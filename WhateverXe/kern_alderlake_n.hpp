@@ -209,6 +209,15 @@ inline bool value(const DisplayReadout &r, uint32_t offset, uint32_t &out) {
     return false;
 }
 
+// -wex-edp-dsc (only together with -wex-edp-keep): some firmware drives the
+// internal panel compressed (Samsung OLED on Raptor Lake-H: DSS_CTL2 left and
+// right VDSC enabled, DSS_CTL1 the intra-pipe DSC joiner, and the transcoder
+// left in CMTG secondary mode, TRANS_DDI_FUNC_CTL2 bit3). WhateverXe cannot
+// program DSC, but with the firmware link kept nothing it owns is reprogrammed:
+// like Linux fastboot (which keeps the inherited CMTG on display 13) only the
+// plane changes. Admit exactly those bits on a panel DDI A/B and nothing else.
+static bool admitDSCPanel=false; // one TU (kern_xe.cpp) in the kext
+constexpr uint32_t CMTGSecondaryMode=1U<<3,DSCJoinerEnable=1U<<30,VDSCEnable=0x80008000U;
 // Source-side certificate for an already-running, uncompressed external SST
 // GOP. This does not prove sink DPCD state, PLL rate or native AUX ownership.
 inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const Display13TC::Boot *tc=nullptr,bool panel=false) {
@@ -233,6 +242,7 @@ inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const
        !value(boot,0x60034+bank,dn) || !value(boot,0x60040+bank,lm) ||
        !value(boot,0x60044+bank,ln))return false;
     const unsigned lanes=((trans>>1)&7)+1;
+    const bool dsc=panel && admitDSCPanel && ddi<2 && !typeC;
     // Linux v6.12 i915_reg.h: SST, normal training, scrambling, no FEC/MST,
     // port sync, HDCP, DSC or joined pipes. Enhanced framing may be on or off.
     // intel_ddi_read_func_ctl classifies SST from MODE_SELECT, not the MST
@@ -240,13 +250,13 @@ inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const
     // preserve it and include it in the unchanged-source check, never clear it
     // on an enabled transcoder or infer an MST transport from that bit alone.
     return (trans&0xFF700000U)==(0x82000000U|((ddi+1)<<27)) &&
-        !(trans&((1U<<15)|(1U<<9))) && !ctl2 &&
+        !(trans&((1U<<15)|(1U<<9))) && (!ctl2 || (dsc && ctl2==CMTGSecondaryMode)) &&
         (lanes==1 || lanes==2 || lanes==4) && ((buf>>1)&7)==lanes-1 &&
         (buf&(typeC && tc->ownershipOptional?0x80000080U:0x800000C0U))==
             (typeC && !tc->ownershipOptional?0x80000040U:0x80000000U) &&
         (clock>>28)==ddi+(typeC?3:1) && (!typeC || clock==tc->transClock) &&
         (tp&~((1U<<18)|(panel?1U<<6:0)))==0x80000300U &&
-        !(dss1&0xF0300000U) && !(dss2&0x80008000U) &&
+        !(dss1&(0xF0300000U&~(dsc?DSCJoinerEnable:0U))) && (dsc ? !(dss2&~VDSCEnable) : !(dss2&VDSCEnable)) &&
         !(dm&0x81000000U) && (dm&0xFFFFFF) &&
         dn && !(dn&0xFF000000U) && lm && !(lm&0xFF000000U) && ln && !(ln&0xFF000000U) &&
         (dm&0xFFFFFF)<=dn;

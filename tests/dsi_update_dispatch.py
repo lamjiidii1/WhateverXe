@@ -38,6 +38,7 @@ struct IORegistryEntry {static IORegistryEntry *getRegistryRoot(){static IORegis
  }};
 IOService *pendingFB=nullptr;bool dsiPendingTarget(IOService *fb){return fb && pendingFB==fb;}using IOLock=int;struct {bool modeReady=false;} dsiPendingBacking;
 bool dsiPublishedTarget(IOService *fb){return dsiPendingTarget(fb) && dsiPendingBacking.modeReady;}
+static void display13FlipArmObserve(IOService *) {}
 struct IORecursiveLock {unsigned depth=0;};
 unsigned owner=0,modeCalls=0,armCalls=0,backingCalls=0;IORecursiveLock fbLock;bool expectDSI=false,endingWriter=false;
 void IOLockLock(IOLock*){assert((fbLock.depth || endingWriter) && !owner);++owner;}void IOLockUnlock(IOLock*){assert(owner==1);--owner;}

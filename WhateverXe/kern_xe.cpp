@@ -20,6 +20,8 @@
 #include "kern_xelp_native_placement.hpp"
 #include <Headers/kern_disasm.hpp>
 #include <Headers/kern_crypto.hpp>
+#include <Headers/kern_mach.hpp>
+#include "kern_mtl_posh_fix.hpp"
 #include "kern_alderlake_n.hpp"
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
@@ -56,6 +58,9 @@
 #include "kern_adls_clock.hpp"
 #include "kern_adls_boot.hpp"
 #include "kern_tgl_combo_signal.hpp"
+#include "kern_display13_edp_keep.hpp"
+#include "kern_display13_edp_blank.hpp"
+#include "kern_display13_edp_auxbl.hpp"
 #include "kern_tgl_panel_depth.hpp"
 #include "kern_xelp_panel_power.hpp"
 #include "kern_adlp_edp_readout.hpp"
@@ -167,6 +172,11 @@ void XE::setHostSurfaceABI(unsigned framebuffer,unsigned accelerator) {
  tglHostSurfaceABI[1]=static_cast<XELPNative::SurfaceABI>(accelerator);
 }
 static bool tglSonomaSurfaceFramebufferReady=false;
+// -wex-edp-dsc diagnostics: the Tahoe TGL framebuffer donor is built with LLVM
+// profile instrumentation (__llvm_prf_cnts, one 64-bit counter per basic block).
+// Its load address lets display13DSCAfterMode publish the live counters.
+static mach_vm_address_t tglFramebufferAddress=0;
+static size_t tglFramebufferSize=0;
 static bool tglInstallSonomaSurfaceABI(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,bool framebuffer) {
  const auto layout=tglHostSurfaceABI[framebuffer?0:1];
  if(layout==XELPNative::SurfaceABI::Unknown)return false;
@@ -187,6 +197,7 @@ static bool tglInstallSonomaSurfaceABI(KernelPatcher &patcher,size_t index,mach_
  };
  const size_t methods[] {framebuffer?0x2B4BAU:0x72834U,framebuffer?0x39FBAU:0x80EF0U};
  const auto sites=framebuffer?fb:accel;
+ if(framebuffer) {tglFramebufferAddress=address;tglFramebufferSize=size;}
  bool ready=size>(framebuffer?0x3A02CU:0x81367U);
  for(unsigned i=0;i<2;++i) {
   ready=ready && patcher.solveSymbol<mach_vm_address_t>(index,symbols[i],address,size)==address+methods[i];
@@ -3930,6 +3941,7 @@ Display13OutputWiring XE::display13BoardWiring(IOService *provider) {
     auto property=provider->getProperty("xelp-hdmi-wiring");
     if(!property)property=provider->getProperty("tgl-hdmi-wiring");
     if(!xeProfile.displayAdmitted() || xeProfile.display!=XELP::Display::XeLPD)return {};
+    XELP::panelAUXBacklight=checkKernelArgument("-wex-edp-dsc") && checkKernelArgument("-wex-edp-keep");
     // Display13 physical capacity is shared by ADL-N and mobile ADL/RPL.
     // VBT chooses board routing; a family name must not exclude TC PHYs.
     Display13OutputWiring board;
@@ -3980,6 +3992,12 @@ void XE::adlnBootstrap(IOPCIDevice *pci) {
 	pci->setProperty("N97PhysicalIdentity", pci->configRead32(0), 32);
 	pci->setProperty("N97PhysicalRevision", revision, 32);
 	if (!admitted) return;
+    // -wex-edp-dsc admits a compressed firmware panel source only for the kept
+    // firmware link (-wex-edp-keep); see AlderLakeN::admitDSCPanel. Set before
+    // the first boot readout; every later panel source check reads it.
+    AlderLakeN::admitDSCPanel=checkKernelArgument("-wex-edp-dsc") && checkKernelArgument("-wex-edp-keep");
+    Display13WM::twoPixelsPerClock()=AlderLakeN::admitDSCPanel;
+    pci->setProperty("WEXEDPDSCAdmitted", AlderLakeN::admitDSCPanel);
     xelpMemory=xelpPhysicalMemory(pci);xelpMemoryGGC=pci->configRead16(0x50);
     uint64_t memory[] {1,xelpMemory.valid,xelpMemory.base,xelpMemory.bytes,xelpMemory.gttBytes,xelpMemory.apertureBytes};
     pci->setProperty("N97PhysicalMemoryLayout",memory,sizeof(memory));
@@ -4398,7 +4416,66 @@ bool XE::xelpInstallHostRPS(KernelPatcher &patcher,size_t index,mach_vm_address_
     return ready;
 }
 
+// -wex-mtl-poshfix (MTLPoshFix): patch the TGL Metal donor's command buffer
+// dealloc when its code is validated on page-in, as Lilu's UserPatcher does.
+// The bundle lives on the data volume, so a boot-time file lookup cannot see it.
+// Both validation entry points are routed when present; the patch is idempotent.
+static mach_vm_address_t mtlPoshOrgValidateRange {}, mtlPoshOrgValidatePage {};
+static uint32_t mtlPoshReady {}, mtlPoshPages {}, mtlPoshWriteFailures {};
+static uint64_t mtlPoshRangeCalls {}, mtlPoshPageCalls {}, mtlPoshBytes {};
+static void mtlPoshScan(const void *data,uint64_t size) {
+ __atomic_fetch_add(&mtlPoshBytes,size,__ATOMIC_RELAXED);
+ MTLPoshFix::forEachMatch(static_cast<const uint8_t *>(data),size,[](uint8_t *at) {
+  if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS) {
+   __atomic_fetch_add(&mtlPoshWriteFailures,1U,__ATOMIC_RELAXED);return;
+  }
+  const bool done=MTLPoshFix::apply(at);
+  MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
+  if(done)__atomic_fetch_add(&mtlPoshPages,1U,__ATOMIC_RELAXED);
+ });
+}
+static boolean_t mtlPoshValidateRange(void *blobs,void *pager,uint64_t offset,const void *data,uint64_t size,unsigned *tainted) {
+ const auto res=FunctionCast(mtlPoshValidateRange,mtlPoshOrgValidateRange)(blobs,pager,offset,data,size,tainted);
+ __atomic_fetch_add(&mtlPoshRangeCalls,1ULL,__ATOMIC_RELAXED);
+ if(res)mtlPoshScan(data,size);
+ return res;
+}
+// xnu bsd/kern/ubc_subr.c: void cs_validate_page(vnode_t, memory_object_t,
+// memory_object_offset_t, const void *data, int *validated_p, int *tainted_p,
+// int *nx_p). The vm_fault x86 path validates 4K pages here; the result is the
+// validated_p out-parameter, not a return value. Forward all seven arguments.
+static void mtlPoshValidatePage(void *vp,void *pager,uint64_t offset,const void *data,int *validated,int *tainted,int *nx) {
+ FunctionCast(mtlPoshValidatePage,mtlPoshOrgValidatePage)(vp,pager,offset,data,validated,tainted,nx);
+ __atomic_fetch_add(&mtlPoshPageCalls,1ULL,__ATOMIC_RELAXED);
+ if(validated && *validated && !(tainted && *tainted))mtlPoshScan(data,MTLPoshFix::PageSize);
+}
+static bool mtlPoshSerialize(void *,void *,OSSerialize *serializer) {
+ // version 3: ready mask (1 range, 2 page), patched sites, write failures,
+ // range calls, page calls, validated bytes
+ const uint64_t q[7] {3,__atomic_load_n(&mtlPoshReady,__ATOMIC_RELAXED),
+  __atomic_load_n(&mtlPoshPages,__ATOMIC_RELAXED),__atomic_load_n(&mtlPoshWriteFailures,__ATOMIC_RELAXED),
+  __atomic_load_n(&mtlPoshRangeCalls,__ATOMIC_RELAXED),__atomic_load_n(&mtlPoshPageCalls,__ATOMIC_RELAXED),
+  __atomic_load_n(&mtlPoshBytes,__ATOMIC_RELAXED)};
+ auto d=OSData::withBytes(q,sizeof(q));if(!d)return false;
+ const bool ok=d->serialize(serializer);d->release();return ok;
+}
+static void installMTLPoshFix(KernelPatcher &patcher) {
+ if(!checkKernelArgument("-wex-mtl-poshfix"))return;
+ uint32_t ready=0;
+ KernelPatcher::RouteRequest range {"_cs_validate_range",mtlPoshValidateRange,mtlPoshOrgValidateRange};
+ if(patcher.routeMultipleLong(KernelPatcher::KernelID,&range,1) && mtlPoshOrgValidateRange)ready|=1;
+ patcher.clearError();
+ KernelPatcher::RouteRequest page {"_cs_validate_page",mtlPoshValidatePage,mtlPoshOrgValidatePage};
+ if(patcher.routeMultipleLong(KernelPatcher::KernelID,&page,1) && mtlPoshOrgValidatePage)ready|=2;
+ patcher.clearError();
+ __atomic_store_n(&mtlPoshReady,ready,__ATOMIC_RELAXED);
+ if(auto s=OSSerializer::forTarget(nullptr,mtlPoshSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXMTLPoshFix",s);s->release();
+ }
+}
+
 void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
+	installMTLPoshFix(patcher);
 	// This must precede tglLoadHDMIWiring, tglPrepareMMIOUC and TGL FIA reads.
 	auto physicalGPU = OSDynamicCast(IOPCIDevice, info->videoBuiltin);
 	selectProfile(XELP::deviceProfile(physicalGPU));
@@ -4983,6 +5060,27 @@ static void adlnIRQRecord(uint64_t (&r)[32],unsigned event) {
 	r[29]=reinterpret_cast<uintptr_t>(c.lock);r[30]=c.handlers;r[31]=c.quiescing|(c.blockedPipes<<8)|(uint64_t(c.softwareHandlers)<<32);
 }
 
+// Live display interrupt counters for frame pacing diagnosis: uptime ns,
+// interrupts, then per pipe vblanks, flips and underruns, then pipe A hardware
+// frame and flip counters (WEXFBIRQLive v2).
+static bool adlnIRQLiveSerialize(void *,void *,OSSerialize *serializer) {
+	uint64_t q[14] {2};auto &c=display13FBIRQ;auto &s=c.state;
+	uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,q+1);
+	if(c.lock) {
+		const auto saved=IOSimpleLockLockDisableInterrupt(c.lock);
+		q[2]=s.interrupts;
+		for(unsigned p=0;p<3;++p){q[3+p]=s.vblanks[p];q[6+p]=s.flips[p];q[9+p]=s.underruns[p];}
+		IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
+	}
+	// Hardware frame and flip counters of pipe A (PIPE_FRMCOUNT/PIPE_FLIPCOUNT),
+	// which count every refresh whether or not vblank interrupts are enabled.
+	if(c.base) {
+		Display13FBIRQIO io {c.base};
+		if(Display13FBIRQ::powered(io.read(Display13FBIRQ::Driver),0)){q[12]=io.read(0x70040);q[13]=io.read(0x70044);}
+	}
+	auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+	const bool ok=data->serialize(serializer);data->release();return ok;
+}
 
 // These operations run under the display owner lock. AUX power qualification
 // needs the TC bank lock but never enters the native port or power callbacks.
@@ -5593,6 +5691,7 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBLifecycleHooksReady",display13FBLifecycleHooksReady);
 	display13FBOutputHooksReady=processDisplay13FramebufferOutput(patcher,index,address,size);
     if(adlnOutputWiring.panel)processDisplay13Panel(patcher,index,address,size);
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPAuxBLReady",processDisplay13EDPAuxBL(patcher,index,address,size));
     display13FBTCHooksReady=processDisplay13FramebufferTC(patcher,index,address,size);
     if(!(adlnOutputWiring.selected()&0x78) && adlnOutputWiring.panel)processDisplay13Training(patcher,index,address,size);
     IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCHooksReady",display13FBTCHooksReady);
@@ -5611,6 +5710,10 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
     const bool displayPowerHooks=processDisplay13NativeAttributes(patcher,index,address,size);
     dsiNativeWriterHooksReady=displayPowerHooks && (!adlnOutputWiring.dsi || (processDSINativeWriters(patcher,index,address,size) &&
         processDSINativeTransactions(patcher,index,address,size)));
+    if(!adlnOutputWiring.dsi)
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlankReady",processDisplay13EDPBlank(patcher,index,address,size));
+    if(!adlnOutputWiring.dsi && checkKernelArgument("-wex-flip-trace"))
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipTraceReady",processDisplay13FlipTrace(patcher,index,address,size));
     dsiBootProbeReady=processDisplay13DSIBoot(patcher,index,address,size);
     dsiCacheHooksReady=processDisplay13DSICache(patcher,index,address,size);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBTopologyHooksReady",display13FBTopologyHooksReady);
@@ -6175,6 +6278,18 @@ IOReturn XE::wrapDisplay13FBDisableIRQ(IOService *controller) {
 	controller->setProperty("N97FBIRQ",record,sizeof(record));
 	return disabled ? kIOReturnSuccess : kIOReturnNotReady;
 }
+// -wex-edp-dsc diagnostics: every VBL configuration the donor asks for, with
+// the pipe A interrupt registers and plane surface right after it. Static
+// storage published once as a no-copy OSData, so ioreg reads it live.
+static uint32_t display13VBLTrace[2+48*8];
+static void display13VBLTraceAdd(Display13FBIRQIO &io,uint32_t pipe,bool enabled,bool valid,bool getLock,uint32_t status,const Display13FBIRQ::State &st) {
+	if(!AlderLakeN::admitDSCPanel)return;
+	auto &t=display13VBLTrace;const uint32_t n=t[1];t[0]=1;t[1]=n+1;
+	auto e=t+2+8*(n<48?n:47);
+	e[0]=n+1;e[1]=(pipe&0xFF)|(enabled?0x100:0)|(valid?0x200:0)|(getLock?0x400:0);e[2]=status;
+	e[3]=(st.active&0xFF)|((st.configured&0xFF)<<8)|(st.faulted?0x10000:0)|(st.enabled?0x20000:0);
+	e[4]=static_cast<uint32_t>(st.vblanks[0]);e[5]=io.read(0x44404);e[6]=io.read(0x4440C);e[7]=io.read(0x7019C);
+}
 void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObject *path,bool enabled,bool getLock) {
 	if(!adlnIRQOwner(controller) || !fb || !path)return;
 	auto &c=display13FBIRQ;Display13FBIRQIO io {c.base};
@@ -6206,6 +6321,7 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 	}
 	else c.status=Display13FBIRQ::fail(io,c.state,Display13FBIRQ::Status::Topology);
 	adlnIRQCache(controller,io);
+	display13VBLTraceAdd(io,pipe,enabled,valid,getLock,static_cast<uint32_t>(c.status),c.state);
 	if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
 }
 bool XE::wrapDisplay13FBProcessIRQ(IOService *controller) {
@@ -7148,6 +7264,43 @@ uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,c
     return result.status;
 }
 
+// -wex-edp-dsc diagnostics: the display registers right after each donor
+// mode set (plane, stride, surface, scaler, DSC, transcoder), the first and the
+// last one, to compare with the firmware's N97Display13Boot.
+// PerformFlipTransaction+0x11 is `incq disp32(%rip)` on the function's first
+// counter (file address 0xD9248, section start 0xD0910, 0x1C200 bytes). Use the
+// runtime displacement, so it stays correct after the KC layout moved __DATA.
+static void display13PublishProfileCounters(IORegistryEntry *root) {
+    constexpr size_t Insn=0x2B613,First=0xD9248,Start=0xD0910,Bytes=0x1C200;
+    uint32_t info[4]={0,0,0,0};
+    if(tglFramebufferAddress && tglFramebufferSize>Insn+7) {
+        auto code=reinterpret_cast<const uint8_t *>(tglFramebufferAddress+Insn);
+        if(code[0]==0x48 && code[1]==0xFF && code[2]==0x05) {
+            int32_t disp;memcpy(&disp,code+3,sizeof(disp));
+            const auto first=tglFramebufferAddress+Insn+7+static_cast<int64_t>(disp);
+            const auto base=first-(First-Start);
+            info[0]=1;info[1]=static_cast<uint32_t>(base-tglFramebufferAddress);info[2]=Bytes;
+            if(auto d=OSData::withBytesNoCopy(reinterpret_cast<void *>(base),Bytes)) {root->setProperty("WEXPrfCnts",d);d->release();info[3]=1;}
+        } else info[0]=2;
+    }
+    root->setProperty("WEXPrfInfo",info,sizeof(info));
+}
+static void display13DSCAfterMode() {
+    auto &c=display13FBPower;
+    if(!AlderLakeN::admitDSCPanel || !c.lock || !c.map)return;
+    static volatile uint32_t calls=0;const auto call=__sync_add_and_fetch(&calls,1);
+    IOLockLock(c.lock);
+    Display13FBBootIO io{c.map};auto &live=c.displayScratch;AlderLakeN::readDisplay(io,true,live);
+    auto root=IORegistryEntry::getRegistryRoot();
+    if(call==1) {
+        root->setProperty("WEXEDPDSCAfterModeFirst",&live,sizeof(live));
+        if(auto d=OSData::withBytesNoCopy(display13VBLTrace,sizeof(display13VBLTrace))) {root->setProperty("WEXVBLTrace",d);d->release();}
+        display13PublishProfileCounters(root);
+    }
+    root->setProperty("WEXEDPDSCAfterMode",&live,sizeof(live));
+    root->setProperty("WEXEDPDSCAfterModeCall",call,32);
+    IOLockUnlock(c.lock);
+}
 uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing) {
     auto self=callbackXE;
     // The GOP-preserving surface adapter must replace this refusal before
@@ -7159,9 +7312,11 @@ uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing
             Display13FBMemory::singlePath<OSObject *>(service) : nullptr;
         if(dsiLifecycleTarget(service,path))return kIOReturnNotReady;
     }
-    return Display13TC::finishMode(
+    const auto result=Display13TC::finishMode(
         [&](){return FunctionCast(wrapDisplay13TCSetMode,self->orgDisplay13TCSetMode)(controller,fb,timing);},
         [&](){reinterpret_cast<void (*)(void *,void *,uint32_t)>(self->display13TCNotify)(controller,fb,1);});
+    display13DSCAfterMode();
+    return result;
 }
 
 bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
@@ -7782,12 +7937,35 @@ bool XE::processDisplay13PanelTrace(KernelPatcher &patcher,size_t index,mach_vm_
  return ok;
 }
 
+// -wex-edp-keep: keep the firmware-trained panel link (kern_display13_edp_keep,
+// wrapDisplay13RegsNeedUpdate). The panel's receiver caps and EDID are seen
+// in the firmware's usual eDP format so the donor's mode set requests it.
+static bool display13EDPKeep() {
+ static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-keep") ? 1 : 0;
+ return v==1;
+}
+// WEXEDPKeepFirst / WEXEDPKeep, one record per complete mode set the donor
+// asked for on a display path while -wex-edp-keep is set (the first one, which
+// still sees the firmware's link, and the last one are published):
+//   version, call, kept (count of kept links), reasons (Display13EDPKeep::Reason),
+//   ddi, pipe, path state (+3644), port lanes (+124), port rate (+128, recorded
+//   only), live TRANS_DDI_FUNC_CTL/TRANSCONF/H,V timings/PIPESRC, requested
+//   TRANS_DDI_FUNC_CTL/timings/PIPESRC, DPCD 0x202..0x207.
+struct Display13EDPKeepRecord {
+ uint32_t version,call,kept,reasons,ddi,pipe,state,portLanes,portRate;
+ uint32_t live[9],wanted[8];uint8_t status[8];
+};
+static volatile uint32_t display13EDPKeepCalls=0,display13EDPKeepKept=0;
+// -wex-edp-auxbl: the panel port, as last seen answering a native DPCD read.
+static void *display13EDPAuxBLPort=nullptr;
 uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_t length) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
  IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
  if(!ready)return kIOReturnNotReady;
  const auto r=FunctionCast(wrapDisplay13ReadAUX,callbackXE->orgDisplay13ReadAUX)(port,address,data,length);
- IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
+ IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);
+ const auto ddi=complete ? Display13FBMemory::field<uint32_t>(port,0x120) : UINT32_MAX;
+ const bool panel=ddi<2 && (callbackXE->adlnOutputWiring.panel&(1U<<ddi));IOLockUnlock(c.lock);
  // -wex-adlp-edp: an eDP 1.4 panel trained through LINK_RATE_SET (0x115)
  // need not report a valid LINK_BW_SET (0x100); this OLED returns 0x01.
  // AGDP derives link bandwidth from 0x100 and then rejects every mode.
@@ -7811,6 +7989,8 @@ uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_
    bw=actual;
   }
  }
+ if(!r && complete && panel && display13EDPKeep())Display13EDPKeep::capLinkCaps(address,static_cast<uint8_t *>(data),length,AlderLakeN::admitDSCPanel);
+ if(!r && complete && panel)__atomic_store_n(&display13EDPAuxBLPort,port,__ATOMIC_RELEASE);
  return r ? r : complete ? 0 : kIOReturnNotReady;
 }
 // -wex-adlp-edp: eDP 1.4 rate-table sinks select the link rate through
@@ -7853,6 +8033,185 @@ uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32
  const auto r=FunctionCast(wrapDisplay13WriteAUX,callbackXE->orgDisplay13WriteAUX)(port,address,data,length);
  IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
  return r ? r : complete ? 0 : kIOReturnNotReady;
+}
+// -wex-edp-auxbl (Display13EDPAuxBL): hwSetBacklight of a kept type-5 AUX
+// panel writes the DPCD brightness through the native AUX path (with the
+// Display13 power checks of wrapDisplay13Read/WriteAUX) instead of the PWM
+// duty the panel ignores. Returns false to let the caller use its own path.
+static bool display13EDPAuxBLRequested() {
+ static int v=-1;
+ if(v<0)v=checkKernelArgument("-wex-edp-auxbl") && display13EDPKeep() && XELP::panelAUXBacklight ? 1 : 0;
+ return v==1;
+}
+static IOLock *display13EDPAuxBLLock=nullptr;
+struct Display13EDPAuxBLRecord {
+ // version, calls, written, declined, failures, last brightness, last level
+ // (VESA level or Intel nits), last result, caps 0x701..0x703, 0x720, 0x721,
+ // mode/control writes
+ uint32_t version,calls,written,declined,failures,brightness,level,result,caps,control,mode,modeWrites,controlWrites;
+ uint8_t intel[4];
+ // stage of the last call (Display13EDPAuxBLStage), port source (1 captured
+ // native read, 2 getPortByDDI of the adopted boot port), DDI, port flags
+ uint32_t stage,source,ddi,flags;
+ // interface (1 VESA, 2 Intel), mode rechecks, first-call dumps of
+ // 0x340..0x35F and 0x700..0x737 before anything was written
+ uint32_t interface,rechecks;
+ uint8_t dump340[32],dump700[56];
+ uint32_t intelReleases; // times 0x344 bit4 was cleared for VESA
+ // Last 32 requests (hwSetBacklight) and writes, each (ms & 0xFFFF)<<16 | value,
+ // and the index of the next slot in each ring.
+ uint32_t reqNext,writeNext,req[32],write[32];
+ uint32_t maxLevel; // level range the panel accepts (0x724 bit count)
+};
+enum Display13EDPAuxBLStage : uint32_t {NoPort=1,TCON,CapsRead,StateRead,Unusable,Written,WriteFailed};
+static Display13EDPAuxBLRecord display13EDPAuxBLState {10};
+static mach_vm_address_t display13EDPAuxBLPortByDDI=0;
+static bool display13EDPAuxBLIntel() {
+ static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-auxbl-intel") ? 1 : 0;
+ return v==1;
+}
+static uint64_t display13EDPAuxBLLastNs=0;
+static bool display13EDPAuxBLCapsValid=false;
+static uint8_t display13EDPAuxBLCaps[3] {};
+static uint16_t display13EDPAuxBLMax=0;
+void XE::display13EDPAuxBLApply(uint32_t brightness) {
+ namespace A=Display13EDPAuxBL;
+ auto port=__atomic_load_n(&display13EDPAuxBLPort,__ATOMIC_ACQUIRE);
+ auto &r=display13EDPAuxBLState;
+ uint32_t source=port ? 1 : 0,ddi=UINT32_MAX;
+ if(!port && display13EDPAuxBLPortByDDI) {
+  // A kept DSC boot link has no resolvable path port, so the donor never
+  // reads the panel's DPCD; take the port object of the adopted boot DDI.
+  auto &c=display13FBPower;
+  if(c.lock){IOLockLock(c.lock);if(c.bootPanel && c.bridge.bootAdopted && c.bridge.bootPort<2)ddi=c.bridge.bootPort;IOLockUnlock(c.lock);}
+  if(ddi<2) {
+   port=reinterpret_cast<void *(*)(uint32_t)>(display13EDPAuxBLPortByDDI)(ddi);
+   if(port){source=2;__atomic_store_n(&display13EDPAuxBLPort,port,__ATOMIC_RELEASE);}
+  }
+ }
+ IOLockLock(display13EDPAuxBLLock);
+ ++r.calls;r.brightness=brightness;r.source=source;r.ddi=ddi;r.stage=NoPort;
+ bool handled=false;
+ // Builtin ports (+0x548 flags 0x18) first offer writeAUX to the controller's
+ // TCON cache hook (+0x1540); without an Apple TCON (+0xD0 NULL, which
+ // display13AUXReady requires) that hook is _CheckCacheDummyCallback and
+ // returns 0, so the native AUX transaction follows unchanged.
+ auto config=port ? Display13FBMemory::field<uint32_t *>(port,0x548) : nullptr;
+ if(config)r.flags=config[5];
+ if(config) {
+  uint32_t e=0;
+  // Every AUX transaction wakes the link out of its low-power state; keep
+  // them to one write per slider step. Capabilities are read once, and the
+  // mode/enable registers again only after a pause (a doze may reset them).
+  if(!display13EDPAuxBLCapsValid) {
+   r.stage=CapsRead;
+   wrapDisplay13ReadAUX(port,0x340,r.dump340,sizeof(r.dump340));
+   for(unsigned o=0;o<sizeof(r.dump700);o+=16)
+    wrapDisplay13ReadAUX(port,0x700+o,r.dump700+o,sizeof(r.dump700)-o<16 ? sizeof(r.dump700)-o : 16);
+   memcpy(r.intel,r.dump340,sizeof(r.intel));
+   e=wrapDisplay13ReadAUX(port,A::CapsAddress,display13EDPAuxBLCaps,sizeof(display13EDPAuxBLCaps));
+   uint8_t bits[3] {};
+   if(!e)e=wrapDisplay13ReadAUX(port,A::BitCountAddress,bits,sizeof(bits));
+   if(!e) {
+    display13EDPAuxBLMax=A::maxLevel(A::Caps{display13EDPAuxBLCaps[0],display13EDPAuxBLCaps[1],display13EDPAuxBLCaps[2]},bits[0],bits[1],bits[2]);
+    display13EDPAuxBLCapsValid=true;
+   }
+  }
+  uint64_t now=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&now);
+  const bool recheck=!display13EDPAuxBLLastNs || now-display13EDPAuxBLLastNs>500000000ULL;
+  const auto &caps=display13EDPAuxBLCaps;
+  r.caps=caps[0]|caps[1]<<8|caps[2]<<16;
+  if(!e && display13EDPAuxBLIntel() && A::IntelCaps{{r.intel[0],r.intel[1],r.intel[2],r.intel[3]}}.usable()) {
+   r.interface=2;r.stage=StateRead;
+   if(recheck) {
+    ++r.rechecks;uint8_t ctrl=0;e=wrapDisplay13ReadAUX(port,A::IntelControlAddress,&ctrl,1);r.control=ctrl;
+    if(!e && !(ctrl&A::IntelBrightnessAuxEnable)){ctrl|=A::IntelBrightnessAuxEnable;e=wrapDisplay13WriteAUX(port,A::IntelControlAddress,&ctrl,1);++r.controlWrites;}
+   }
+   const auto n=A::nits(brightness);
+   if(!e){uint8_t l[2]={static_cast<uint8_t>(n),static_cast<uint8_t>(n>>8)};e=wrapDisplay13WriteAUX(port,A::IntelNitsAddress,l,sizeof(l));}
+   r.level=n;handled=true;
+  } else if(!e) {
+   r.interface=1;
+   uint8_t state[2]={static_cast<uint8_t>(r.control),static_cast<uint8_t>(r.mode)};
+   if(recheck){++r.rechecks;r.stage=StateRead;e=wrapDisplay13ReadAUX(port,A::ControlAddress,state,sizeof(state));}
+   // The firmware leaves the Intel TCON brightness (0x344 bit4) in charge;
+   // with both interfaces enabled the panel flashes on every VESA write.
+   // Hand brightness to VESA alone, as Linux does when it uses VESA.
+   if(!e && recheck && A::IntelCaps{{r.intel[0],r.intel[1],r.intel[2],r.intel[3]}}.usable()) {
+    uint8_t ctrl=0;
+    if(!wrapDisplay13ReadAUX(port,A::IntelControlAddress,&ctrl,1) && (ctrl&A::IntelBrightnessAuxEnable)) {
+     ctrl&=~A::IntelBrightnessAuxEnable;
+     if(!wrapDisplay13WriteAUX(port,A::IntelControlAddress,&ctrl,1))++r.intelReleases;
+    }
+   }
+   if(!e) {
+    r.control=state[0];r.mode=state[1];
+    const auto p=A::plan(A::Caps{caps[0],caps[1],caps[2]},state[0],state[1],brightness,display13EDPAuxBLMax);
+    r.maxLevel=display13EDPAuxBLMax;
+    if(p.usable) {
+     if(p.writeMode){uint8_t m=p.mode;e=wrapDisplay13WriteAUX(port,A::ModeAddress,&m,1);++r.modeWrites;if(!e)r.mode=m;}
+     if(!e && p.writeControl){uint8_t c=p.control;e=wrapDisplay13WriteAUX(port,A::ControlAddress,&c,1);++r.controlWrites;if(!e)r.control=c;}
+     if(!e){uint8_t l[2]={p.level[0],p.level[1]};e=wrapDisplay13WriteAUX(port,A::LevelAddress,l,p.levelLength);}
+     r.level=p.value;
+     r.write[r.writeNext++%32]=static_cast<uint32_t>((now/1000000ULL)&0xFFFF)<<16|p.value;
+     handled=true;
+    } else {++r.declined;r.stage=Unusable;}
+   }
+  }
+  display13EDPAuxBLLastNs=now;
+  r.result=e;
+  if(handled && e){++r.failures;r.stage=WriteFailed;display13EDPAuxBLLastNs=0;}
+  else if(handled){++r.written;r.stage=Written;}
+ } else ++r.declined;
+ const auto copy=r;
+ IOLockUnlock(display13EDPAuxBLLock);
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPAuxBL",const_cast<Display13EDPAuxBLRecord *>(&copy),sizeof(copy));
+}
+// The AUX transactions run on a thread call, never in the caller of
+// hwSetBacklight: WindowServer's brightness request must not wait on the panel.
+// Requests are coalesced; only the latest level is written.
+static volatile uint64_t display13EDPAuxBLPending=0; // bit32 set = pending
+static thread_call_t display13EDPAuxBLCall=nullptr;
+static volatile uint64_t display13EDPAuxBLLastWrite=0;
+void XE::display13EDPAuxBLWork(thread_call_param_t,thread_call_param_t) {
+ const auto v=__atomic_exchange_n(&display13EDPAuxBLPending,0ULL,__ATOMIC_ACQ_REL);
+ if(!(v>>32))return;
+ const auto start=mach_absolute_time();
+ __atomic_store_n(&display13EDPAuxBLLastWrite,start,__ATOMIC_RELEASE);
+ display13EDPAuxBLApply(static_cast<uint32_t>(v));
+ // A request that arrived while this call ran must still land.
+ if(__atomic_load_n(&display13EDPAuxBLPending,__ATOMIC_ACQUIRE)>>32) {
+  uint64_t interval=0;nanoseconds_to_absolutetime(50000000ULL,&interval);
+  thread_call_enter_delayed(display13EDPAuxBLCall,start+interval);
+ }
+}
+bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t &result) {
+ if(!display13EDPAuxBLRequested() || !controller || !display13EDPAuxBLLock || !display13EDPAuxBLCall)return false;
+ {
+  uint64_t now=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&now);
+  auto &r=display13EDPAuxBLState;
+  IOLockLock(display13EDPAuxBLLock);
+  r.req[r.reqNext++%32]=static_cast<uint32_t>((now/1000000ULL)&0xFFFF)<<16|(brightness>0xFFFF ? 0xFFFF : brightness);
+  IOLockUnlock(display13EDPAuxBLLock);
+ }
+ // The panel ignores the PWM duty; never fall back to it (or to its power path).
+ *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
+ __atomic_store_n(&display13EDPAuxBLPending,(1ULL<<32)|brightness,__ATOMIC_RELEASE);
+ // macOS ramps brightness at ~100 Hz and every AUX write wakes the panel
+ // link. Write at most every 50 ms (the latest level always lands), or with
+ // -wex-edp-auxbl-final only once the requests pause for 200 ms.
+ static int final=-1;if(final<0)final=checkKernelArgument("-wex-edp-auxbl-final") ? 1 : 0;
+ uint64_t now=mach_absolute_time(),interval=0;
+ nanoseconds_to_absolutetime(final ? 200000000ULL : 50000000ULL,&interval);
+ if(final)thread_call_enter_delayed(display13EDPAuxBLCall,now+interval);
+ else {
+  const auto last=__atomic_load_n(&display13EDPAuxBLLastWrite,__ATOMIC_ACQUIRE);
+  if(last && now-last<interval) {
+   if(!thread_call_isactive(display13EDPAuxBLCall))thread_call_enter_delayed(display13EDPAuxBLCall,last+interval);
+  } else thread_call_enter(display13EDPAuxBLCall);
+ }
+ result=0;
+ return true;
 }
 uint32_t XE::wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
@@ -8094,6 +8453,21 @@ bool XE::processDisplay13FramebufferSST(KernelPatcher &patcher,size_t index,mach
   {disable,wrapDisplay13DisablePort,orgDisplay13DisablePort}
  };
  display13FBSSTHooksReady=patcher.routeMultiple(index,routes,arrsize(routes),address,size);patcher.clearError();
+ // -wex-edp-keep only: the mode-set decision (wrapDisplay13RegsNeedUpdate) at
+ // its Tahoe TGL framebuffer address. Its 17-byte prologue has no
+ // RIP-relative operand; a missing hook leaves the donor's own decision and
+ // the rest of the SST frontend unchanged.
+ if(display13FBSSTHooksReady && display13EDPKeep()) {
+  const char *regs="__ZN31AppleIntelFramebufferController16hwRegsNeedUpdateEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsPK29IODetailedTimingInformationV2PN16AppleIntelScaler12SCALERPARAMSE";
+  const uint8_t regsEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18};
+  const auto u=patcher.solveSymbol<mach_vm_address_t>(index,regs,address,size);patcher.clearError();
+  bool ready=u==address+0x4F044 && !memcmp(reinterpret_cast<void *>(u),regsEntry,sizeof(regsEntry));
+  if(ready) {
+   KernelPatcher::RouteRequest route[] {{regs,wrapDisplay13RegsNeedUpdate,orgDisplay13RegsNeedUpdate}};
+   ready=patcher.routeMultiple(index,route,arrsize(route),address,size);patcher.clearError();
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPKeepReady",ready);
+ }
  return display13FBSSTHooksReady;
 }
 
@@ -8113,6 +8487,25 @@ uint8_t *XE::display13SSTPort(void *port,bool unprobed) {
     // still mode 0. Every AUX/training user requires the probed mode.
     (Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U) &&
      !(unprobed && config[0]<3 && !Display13FBMemory::field<uint32_t>(p,0x550))) ||
+    Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
+ return p;
+}
+
+// At the firmware handoff a Combo eDP port still has native mode 0: Apple's setPortMode has not run yet, and
+// display13SSTPort requires exactly 1 (the AUX gate already accepts 0 or 1 on Combo ports). Admit that one case for the
+// handoff only: the same terms, on the DDI the VBT names as the panel. Every other caller keeps the exact check, and
+// Raptor Lake-U stays on the boot framebuffer until its display clock is implemented.
+uint8_t *XE::display13PanelBootPort(void *port) {
+ auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
+ if(!s->display13FramebufferRequested || s->xeProfile.display!=XELP::Display::XeLPD || XELP::raptorLakeUDevice(s->xeProfile.identity) ||
+    !s->display13FBSSTHooksReady ||
+    !object || object->getMetaClass()->getClassSize()<0x624 || !c.controller ||
+    c.controller!=s->adlnTopologyController || !adlnWriterMappingBound() ||
+    c.clockFaulted || c.memoryFaulted || c.panelFaulted || c.clockStopped || !s->adlnOutputWiring.described())return nullptr;
+ auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
+ if(!config || !Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring) ||
+    config[0]>=2 || !(s->adlnOutputWiring.panel&(1U<<config[0])) || p[0x117] ||
+    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=0 ||
     Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
  return p;
 }
@@ -8246,6 +8639,488 @@ uint32_t XE::wrapDisplay13TrainingPattern(void *path,uint32_t pattern) {
  if(result || pattern>5)return result;
  return program(false)?0:kIOReturnNotReady;
 }
+
+// -wex-edp-keep (Display13EDPKeep): the donor asks for a complete mode set of
+// the boot panel path because its cached CRTCParams and current mode are the
+// boot placeholders, and that mode set stops the firmware's link and
+// retrains it. When the path is the one WhateverXe adopted at handoff, the
+// firmware's eDP SST source still runs (AlderLakeN::dpSource on a fresh
+// readout) and its pipe already has exactly the requested active image, lanes
+// and depth, report no register update: the donor's own same-mode branch then
+// updates only the plane and scaler (hwSetMode "Partial modeset"), leaves the
+// path attached (+3644 stays 2) and returns success. Anything else keeps the
+// donor's answer. The owner lock is held only for the register readout; the
+// DPCD status read runs after it.
+// -wex-edp-dsc-retrain (with -wex-edp-keep -wex-edp-dsc): do not keep the
+// firmware's compressed link. Linux drives the Galaxy Book3 Ultra panel
+// uncompressed at 2880x1800@120, 8 bpc, four HBR2 lanes, so let the donor run
+// its complete mode set on the capped HBR2 caps, after clearing the pipe A
+// VDSC and DSC joiner enables it never programs.
+static bool display13DSCRetrainLink(void *path) {
+ static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-dsc-retrain") ? 1 : 0;
+ auto &c=display13FBPower;
+ if(v!=1 || !AlderLakeN::admitDSCPanel || !c.lock || !c.map || !path)return false;
+ if(static_cast<OSObject *>(path)->getMetaClass()->getClassSize()<0x3730 || Display13FBMemory::field<uint32_t>(path,0x3640)!=0)return false;
+ IOLockLock(c.lock);
+ const auto base=c.map->getVirtualAddress();const bool ok=base && c.map->getLength()==0x1000000;
+ uint32_t before[2] {},after[2] {};
+ if(ok) {
+  auto reg=[&](uint32_t o)->volatile uint32_t &{return *reinterpret_cast<volatile uint32_t *>(base+o);};
+  before[0]=reg(0x78000);before[1]=reg(0x78004);
+  reg(0x78004)=before[1]&~0x80008000U;reg(0x78000)=before[0]&~0x40000000U;
+  after[0]=reg(0x78000);after[1]=reg(0x78004);
+ }
+ IOLockUnlock(c.lock);
+ static volatile uint32_t calls=0;const uint32_t record[5]={__sync_add_and_fetch(&calls,1),before[0],before[1],after[0],after[1]};
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPDSCRetrain",const_cast<uint32_t *>(record),sizeof(record));
+ return ok;
+}
+bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler) {
+ auto s=callbackXE;auto &c=display13FBPower;
+ const bool update=FunctionCast(wrapDisplay13RegsNeedUpdate,s->orgDisplay13RegsNeedUpdate)(controller,fb,path,params,timing,scaler);
+ if(!update || !display13EDPKeep() || !c.lock || !path || !params)return update;
+ if(display13DSCRetrainLink(path))return update;
+ namespace K=Display13EDPKeep;
+ Display13EDPKeepRecord record {};record.version=1;record.call=__sync_add_and_fetch(&display13EDPKeepCalls,1);
+ record.ddi=record.pipe=record.state=UINT32_MAX;
+ uint32_t reasons=0,lanes=0;void *port=nullptr;
+ IOLockLock(c.lock);
+ auto object=static_cast<OSObject *>(path);
+ if(object->getMetaClass()->getClassSize()>=0x3730) {
+  port=Display13FBMemory::field<void *>(path,0x3648);
+  record.pipe=Display13FBMemory::field<uint32_t>(path,0x3640);record.state=Display13FBMemory::field<uint32_t>(path,0x3644);
+ }
+ // The panel's Combo port can still have the native mode 0 of the handoff:
+ // setPortMode runs in the donor's complete mode set, which a kept link skips.
+ auto p=port ? display13SSTPort(port) : nullptr;
+ if(!p && port)p=display13PanelBootPort(port);
+ if(p)record.ddi=Display13FBMemory::field<uint32_t>(p,0x120);
+ // -wex-edp-dsc: a later mode set of the same boot path (macOS switching from
+ // the native mode to its default HiDPI mode, same timing) can arrive with the
+ // path's port no longer resolvable (path state 1, Galaxy Book3 Ultra). The
+ // firmware's compressed link still runs and cannot be retrained here, so
+ // decide on the adopted boot path and the live pipe exactly as for the first.
+ const bool dscBootPath=!p && AlderLakeN::admitDSCPanel && controller==c.controller && record.pipe==0 &&
+  c.bootPanel && c.bridge.bootAdopted && c.bridge.bootPath==reinterpret_cast<uintptr_t>(path) && c.bridge.bootPort<2;
+ if(dscBootPath)record.ddi=c.bridge.bootPort;
+ if((!p && !dscBootPath) || controller!=c.controller || record.ddi>=2 || !(s->adlnOutputWiring.panel&(1U<<record.ddi)) || record.pipe!=0)reasons|=K::NotPanel;
+ else {
+  if(p){record.portLanes=Display13FBMemory::field<uint32_t>(p,0x124);record.portRate=Display13FBMemory::field<uint32_t>(p,0x128);}
+  if(!c.bootPanel || c.bridge.bootPort!=record.ddi || !c.bridge.bootAdopted ||
+     c.bridge.bootPath!=reinterpret_cast<uintptr_t>(path))reasons|=K::NotBoot;
+  Display13FBBootIO io{c.map};auto &live=c.displayScratch;AlderLakeN::readDisplay(io,true,live);
+  uint32_t values[arrsize(K::LiveRegisters)] {};bool read=live.status==AlderLakeN::ReadoutStatus::Complete;
+  for(unsigned i=0;read && i<arrsize(K::LiveRegisters);++i)read=AlderLakeN::value(live,K::LiveRegisters[i],values[i]);
+  for(unsigned i=0;i<arrsize(K::LiveRegisters);++i)record.live[i]=values[i];
+  if(!read)reasons|=K::Readout;
+  else {
+   if(!AlderLakeN::dpSource(live,0,record.ddi,nullptr,true))reasons|=K::NoSource;
+   K::Live l {};l.func=values[0];l.transconf=values[1];
+   for(unsigned i=0;i<6;++i)l.timing[i]=values[2+i];
+   l.source=values[8];lanes=((l.func>>1)&7)+1;
+   reasons|=K::compare(l,K::wanted(params),record.portLanes,AlderLakeN::admitDSCPanel);
+  }
+  const auto w=K::wanted(params);record.wanted[0]=w.func;
+  for(unsigned i=0;i<6;++i)record.wanted[1+i]=w.timing[i];
+  record.wanted[7]=w.source;
+ }
+ IOLockUnlock(c.lock);
+ if(!(reasons&K::NotPanel) && port) {
+  uint8_t status[6] {};
+  const auto r=wrapDisplay13ReadAUX(port,0x202,status,sizeof(status));
+  if(r || !K::sinkTrained(status,lanes))reasons|=K::Sink;
+  memcpy(record.status,status,sizeof(status));
+ }
+ record.reasons=reasons;
+ const bool keep=!(reasons&K::Blocking);
+ if(keep)record.kept=__sync_add_and_fetch(&display13EDPKeepKept,1);
+ else record.kept=display13EDPKeepKept;
+ auto root=IORegistryEntry::getRegistryRoot();
+ if(record.call==1)root->setProperty("WEXEDPKeepFirst",&record,sizeof(record));
+ root->setProperty("WEXEDPKeep",&record,sizeof(record));
+ if(keep && record.kept==1)
+  SYSLOG("igfx","eDP keep: firmware link kept on DDI %u, pipe A (sink status %02x %02x %02x)",record.ddi,record.status[0],record.status[1],record.status[2]);
+ else if(!keep && record.call==1)
+  SYSLOG("igfx","eDP keep: firmware link not kept (reasons 0x%x, state %u, sink status %02x %02x %02x)",reasons,record.state,record.status[0],record.status[1],record.status[2]);
+ return keep ? false : update;
+}
+// -wex-edp-blank (Display13EDPBlank): AppleIntelFramebuffer::setFramebufferPowerState
+// of the adopted boot panel on a kept link only blanks/unblanks the primary
+// plane and cursor; the donor's power transition (link stop, retraining) is
+// skipped and its recorded state (+0x4284, as in the DSI power path) updated.
+static bool display13EDPBlankRequested() {
+ static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-blank") ? 1 : 0;
+ return v==1;
+}
+static Display13EDPBlank::State display13EDPBlankState;
+bool XE::processDisplay13EDPAuxBL(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(!display13EDPAuxBLRequested() || !display13FramebufferRequested)return false;
+ if(!display13EDPAuxBLLock)display13EDPAuxBLLock=IOLockAlloc();
+ if(!display13EDPAuxBLCall)display13EDPAuxBLCall=thread_call_allocate(display13EDPAuxBLWork,nullptr);
+ if(!display13EDPAuxBLLock || !display13EDPAuxBLCall || !orgDisplay13ReadAUX || !orgDisplay13WriteAUX)return false;
+ // The Display13 panel path may already own hwSetBacklight (wrapADLSPanelBacklight
+ // calls display13EDPAuxBrightness first). Otherwise route it here.
+ {
+  const uint8_t byDDI[]={0x55,0x48,0x89,0xe5,0x48,0xff,0x05};
+  const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN14AppleIntelPort12getPortByDDIEj",address,size);patcher.clearError();
+  if(fn==address+0x1b1ea && !memcmp(reinterpret_cast<void *>(fn),byDDI,sizeof(byDDI)))display13EDPAuxBLPortByDDI=fn;
+ }
+ if(orgADLSPanelBacklight)return true;
+ const char *symbol="__ZN31AppleIntelFramebufferController14hwSetBacklightEj";
+ const uint8_t entry[]={0x55,0x48,0x89,0xe5,0x41,0x56,0x53,0x48,0xff,0x05,0x90,0x44,0x09,0x00};
+ const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
+ if(size<0x4a5d4 || fn!=address+0x4a56a || memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry)))return false;
+ KernelPatcher::RouteRequest route {symbol,wrapADLSPanelBacklight,orgADLSPanelBacklight};
+ const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+ return ready && orgADLSPanelBacklight;
+}
+// -wex-flip-trace (diagnostic): per flip transaction, how many hardware flips
+// (PIPE_FLIPCOUNT A) and which plane/cursor surface registers changed across
+// the donor's PerformFlipTransaction, plus the interval between transactions.
+// Published live in WEXFlipTrace:
+//  [0] version [1] transactions [2] hw flips inside [3] transactions with >1 flip
+//  [4] plane1 SURF changes [5] plane2 SURF changes [6] plane3 SURF changes
+//  [7] cursor BASE changes [8..13] interval histogram <4,<8.4,<12.5,<16.7,<25,>=25 ms
+//  [14] last result [15] max ns spent inside the call
+static uint64_t display13FlipTrace[16] {1};
+static IOSimpleLock *display13FlipTraceLock=nullptr;
+static uint64_t display13FlipTraceLast=0;
+// WEXFlipWM: who adds the second flip? Counts WEX's own watermark trigger path
+// (adlnWMEnable, its queued surface trigger and armUpdate), in total and while a
+// PerformFlipTransaction is running.
+//  [0] version [1] wmEnable calls [2] ...inside a flip [3] queued triggers
+//  [4] ...inside a flip [5] armUpdate calls [6] ...inside a flip
+static uint64_t display13FlipWM[8] {1};
+static volatile uint32_t display13FlipDepth=0;
+static inline void display13FlipWMBump(unsigned total) {
+ __atomic_add_fetch(&display13FlipWM[total],1,__ATOMIC_RELAXED);
+ if(__atomic_load_n(&display13FlipDepth,__ATOMIC_RELAXED))__atomic_add_fetch(&display13FlipWM[total+1],1,__ATOMIC_RELAXED);
+}
+static bool display13FlipWMSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[8];for(unsigned i=0;i<8;++i)q[i]=__atomic_load_n(&display13FlipWM[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// WEXFlipSurf: who writes PLANE_SURF_1_A (0x7019C) during a flip transaction?
+// Sampled in the existing WriteRegister32 route; three return addresses from
+// the frame-pointer chain, as donor offsets (bit 63 = outside the donor).
+//  [0] version [1] SURF writes inside a flip [2] slots used
+//  [3..34] 8 slots x {count, ra0, ra1, ra2}
+static uint64_t display13FlipDonorBase=0,display13FlipDonorSize=0;
+static uint64_t display13FlipSurf[35] {1};
+static void display13FlipSurfSample(const uint64_t *fp) {
+ uint64_t ra[3] {};
+ const uint64_t *f=fp;
+ for(unsigned i=0;i<3 && f;++i) {
+  ra[i]=f[1];
+  const auto here=reinterpret_cast<uintptr_t>(f),next=static_cast<uintptr_t>(f[0]);
+  if(next<=here || next-here>0x4000 || (next&7))break;
+  f=reinterpret_cast<const uint64_t *>(next);
+ }
+ const auto base=display13FlipDonorBase,size=display13FlipDonorSize;
+ for(auto &r:ra)if(r)r=(base && r>=base && r-base<size) ? r-base : (r|(1ULL<<63));
+ if(!display13FlipTraceLock)return;
+ const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);
+ auto &q=display13FlipSurf;++q[1];
+ for(unsigned i=0;i<8;++i) {
+  auto slot=q+3+4*i;
+  if(slot[0] && slot[1]==ra[0] && slot[2]==ra[1] && slot[3]==ra[2]) {++slot[0];break;}
+  if(!slot[0]) {slot[0]=1;slot[1]=ra[0];slot[2]=ra[1];slot[3]=ra[2];q[2]=i+1;break;}
+ }
+ IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
+}
+static bool display13FlipSurfSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[35];
+ if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipSurf,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
+ else memcpy(q,display13FlipSurf,sizeof(q));
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// WEXFlipVBlank: hwWaitForVBlank calls, and how long they block, while a
+// PerformFlipTransaction runs.
+//  [0] version [1] calls inside a flip [2] total ns [3] max ns
+//  [4..8] duration <1, <4, <8.4, <16.7, >=16.7 ms [9] calls outside a flip
+//  [10..15] 3 caller slots {donor return offset, count}
+static uint64_t display13FlipVBlank[16] {1};
+static bool display13FlipVBlankSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[16];
+ if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipVBlank,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
+ else memcpy(q,display13FlipVBlank,sizeof(q));
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// WEXFlipQueue: the trigger packets armUpdate flushes during a flip, and the
+// optional -wex-flip-dedupe experiment that drops an earlier pipe A plane
+// surface packet when a later one in the same queue has the same value.
+//  [0] version [1] armUpdate calls inside a flip [2] paths flushed
+//  [3] last packet count [4] max packet count [5] SURF packets seen
+//  [6] SURF packets removed [7] dedupe enabled
+//  [8..31] last snapshot: 12 packets x {reg<<32|value, flags}
+static uint64_t display13FlipQueue[32] {1};
+static bool display13FlipDedupe=false;
+static bool display13FlipQueueSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[32];
+ if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipQueue,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
+ else memcpy(q,display13FlipQueue,sizeof(q));
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// Called from the armUpdate route before the donor flushes, with the
+// framebuffer mutex the donor already holds for the flip.
+static void display13FlipArmObserve(IOService *fb) {
+ if(!display13FlipTraceLock || !fb || !__atomic_load_n(&display13FlipDepth,__ATOMIC_RELAXED))return;
+ if(fb->getMetaClass()->getClassSize()<0x4B90)return;
+ auto base=reinterpret_cast<uint8_t *>(fb);
+ const bool single=*reinterpret_cast<int32_t *>(base+0x3FD8)==-1;
+ const uint32_t paths=*reinterpret_cast<uint32_t *>(base+(single ? 0x49E8 : 0x4A00));
+ if(paths>3)return;
+ const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);
+ auto &q=display13FlipQueue;++q[1];q[7]=display13FlipDedupe;
+ for(uint32_t i=0;i<paths;++i) {
+  auto path=*reinterpret_cast<OSObject **>(base+(single ? 0x49F0 : 0x4A08)+8*i);
+  if(!path || path->getMetaClass()->getClassSize()<0x3730)continue;
+  auto pb=reinterpret_cast<uint8_t *>(path);
+  auto &count=*reinterpret_cast<uint32_t *>(pb+0x35F0);
+  auto packet=reinterpret_cast<uint32_t *>(pb+0x32F0); // {reg,value,flags} x 64
+  uint32_t n=count;if(n>64)continue;
+  ++q[2];q[3]=n;if(n>q[4])q[4]=n;
+  for(uint32_t k=0;k<n;++k)if(packet[3*k]==0x7019C)++q[5];
+  if(i==0)for(uint32_t k=0;k<12;++k) {
+   q[8+2*k]=k<n ? (uint64_t(packet[3*k])<<32|packet[3*k+1]) : 0;q[9+2*k]=k<n ? packet[3*k+2] : 0;
+  }
+  if(!display13FlipDedupe)continue;
+  // Keep the slot after the last packet as it was: the donor's flush reads
+  // the flags at index count after every write.
+  uint32_t stale[3]={0,0,0};const bool hasStale=n<64;
+  if(hasStale)memcpy(stale,packet+3*n,sizeof(stale));
+  uint32_t out=0;
+  for(uint32_t k=0;k<n;++k) {
+   bool drop=false;
+   // Pipe A plane surface registers (PLANE_SURF_n_A). The flush writes
+   // reg/value only, so an earlier packet with the same value is redundant.
+   const auto reg=packet[3*k];
+   if((reg>>12)==0x70 && (reg&0xFFF)>=0x19C && (reg&0xFF)==0x9C)for(uint32_t j=k+1;j<n;++j)
+    if(packet[3*j]==reg) {drop=packet[3*j+1]==packet[3*k+1];break;}
+   if(drop) {++q[6];continue;}
+   if(out!=k)memmove(packet+3*out,packet+3*k,3*sizeof(uint32_t));
+   ++out;
+  }
+  if(out!=n) {count=out;if(hasStale)memcpy(packet+3*out,stale,sizeof(stale));}
+ }
+ IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
+}
+// WEXFlipCompl: when does the donor mark a flip complete (fb+0x4008 back to
+// -1, what IsTransactionComplete reports), and how soon does WindowServer
+// send the next flip after that.
+//  [0] version [1] VBL handler calls [2] ...with a flip pending before
+//  [3] completions inside the VBL handler [4] completed already at flip end
+//  [5] flips started while the previous one was still pending
+//  [6..9] flip end -> VBL completion: <8.4, <16.7, <25, >=25 ms
+//  [10..14] completion -> next flip start: <1, <4, <8.4, <16.7, >=16.7 ms
+//  [15] last pending value at flip start [16] last fb+0x4004 at VBL
+static IOService *display13FlipLastFB=nullptr;
+static uint64_t display13FlipLastEnd=0,display13FlipLastComplete=0;
+static uint64_t display13FlipCompl[20] {1};
+static bool display13FlipComplSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[20];
+ if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipCompl,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
+ else memcpy(q,display13FlipCompl,sizeof(q));
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static bool display13FlipTraceSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[16];
+ if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipTrace,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
+ else memcpy(q,display13FlipTrace,sizeof(q));
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+uint32_t XE::wrapDisplay13FlipTrace(IOService *fb,void *transaction,uint64_t arg,void *params) {
+ auto s=callbackXE;auto &c=display13FBPower;
+ volatile uint8_t *base=nullptr;
+ if(c.map && c.map->getLength()==0x1000000)base=reinterpret_cast<volatile uint8_t *>(c.map->getVirtualAddress());
+ constexpr uint32_t regs[] {0x70044,0x7019C,0x7029C,0x7039C,0x70084};
+ uint32_t before[5] {},after[5] {};
+ uint64_t t0;clock_get_uptime(&t0);absolutetime_to_nanoseconds(t0,&t0);
+ if(base)for(unsigned i=0;i<5;++i)before[i]=*reinterpret_cast<volatile uint32_t *>(base+regs[i]);
+ const bool fbok=fb && fb->getMetaClass()->getClassSize()>=0x4B90;
+ const int32_t pend0=fbok ? *reinterpret_cast<volatile int32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4008) : -1;
+ __atomic_add_fetch(&display13FlipDepth,1,__ATOMIC_RELAXED);
+ const auto r=FunctionCast(wrapDisplay13FlipTrace,s->orgDisplay13FlipTrace)(fb,transaction,arg,params);
+ __atomic_sub_fetch(&display13FlipDepth,1,__ATOMIC_RELAXED);
+ const int32_t pend1=fbok ? *reinterpret_cast<volatile int32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4008) : 0;
+ if(base)for(unsigned i=0;i<5;++i)after[i]=*reinterpret_cast<volatile uint32_t *>(base+regs[i]);
+ uint64_t t1;clock_get_uptime(&t1);absolutetime_to_nanoseconds(t1,&t1);
+ if(display13FlipTraceLock) {
+  const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);
+  auto &q=display13FlipTrace;
+  ++q[1];
+  if(base) {
+   const uint32_t flips=after[0]-before[0];
+   q[2]+=flips;if(flips>1)++q[3];
+   for(unsigned i=1;i<5;++i)if(after[i]!=before[i])++q[3+i];
+  }
+  if(display13FlipTraceLast) {
+   const uint64_t d=t0-display13FlipTraceLast;
+   const unsigned b=d<4000000ULL?0:d<8400000ULL?1:d<12500000ULL?2:d<16700000ULL?3:d<25000000ULL?4:5;
+   ++q[8+b];
+  }
+  display13FlipTraceLast=t0;
+  q[14]=r;if(t1-t0>q[15])q[15]=t1-t0;
+  if(fbok) {
+   auto &k=display13FlipCompl;
+   if(pend0!=-1)++k[5];
+   k[15]=static_cast<uint32_t>(pend0);
+   if(display13FlipLastComplete) {
+    const uint64_t d=t0-display13FlipLastComplete;
+    ++k[10+(d<1000000ULL?0:d<4000000ULL?1:d<8400000ULL?2:d<16700000ULL?3:4)];
+    display13FlipLastComplete=0;
+   }
+   if(pend1==-1) {++k[4];display13FlipLastComplete=t1;}
+   display13FlipLastEnd=t1;display13FlipLastFB=fb;
+  }
+  IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
+ }
+ return r;
+}
+uint64_t XE::wrapDisplay13FlipVBlank(void *controller,void *fb,uint32_t count) {
+ const bool inside=__atomic_load_n(&display13FlipDepth,__ATOMIC_RELAXED)!=0;
+ auto ra=reinterpret_cast<uint64_t>(__builtin_return_address(0));
+ const auto base=display13FlipDonorBase;
+ ra=(base && ra>=base && ra-base<display13FlipDonorSize) ? ra-base : (ra|(1ULL<<63));
+ uint64_t t0;clock_get_uptime(&t0);absolutetime_to_nanoseconds(t0,&t0);
+ const auto r=FunctionCast(wrapDisplay13FlipVBlank,callbackXE->orgDisplay13FlipVBlank)(controller,fb,count);
+ uint64_t t1;clock_get_uptime(&t1);absolutetime_to_nanoseconds(t1,&t1);
+ if(display13FlipTraceLock) {
+  const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);
+  auto &q=display13FlipVBlank;
+  if(inside) {
+   const uint64_t d=t1-t0;
+   ++q[1];q[2]+=d;if(d>q[3])q[3]=d;
+   ++q[4+(d<1000000ULL?0:d<4000000ULL?1:d<8400000ULL?2:d<16700000ULL?3:4)];
+   for(unsigned i=0;i<3;++i) {
+    auto slot=q+10+2*i;
+    if(slot[1] && slot[0]==ra) {++slot[1];break;}
+    if(!slot[1]) {slot[0]=ra;slot[1]=1;break;}
+   }
+  } else ++q[9];
+  IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
+ }
+ return r;
+}
+uint64_t XE::wrapDisplay13FlipVBL(void *controller,uint32_t pipe) {
+ auto fb=__atomic_load_n(&display13FlipLastFB,__ATOMIC_RELAXED);
+ auto fbb=reinterpret_cast<uint8_t *>(fb);
+ const int32_t pre=fb ? *reinterpret_cast<volatile int32_t *>(fbb+0x4008) : -2;
+ const auto r=FunctionCast(wrapDisplay13FlipVBL,callbackXE->orgDisplay13FlipVBL)(controller,pipe);
+ const int32_t post=fb ? *reinterpret_cast<volatile int32_t *>(fbb+0x4008) : -2;
+ uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&t);
+ if(fb && display13FlipTraceLock) {
+  const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);
+  auto &k=display13FlipCompl;
+  ++k[1];if(pre!=-1)++k[2];
+  k[16]=*reinterpret_cast<volatile uint32_t *>(fbb+0x4004);
+  if(pre!=-1 && post==-1) {
+   ++k[3];
+   const uint64_t d=display13FlipLastEnd && t>display13FlipLastEnd ? t-display13FlipLastEnd : 0;
+   ++k[6+(d<8400000ULL?0:d<16700000ULL?1:d<25000000ULL?2:3)];
+   display13FlipLastComplete=t;
+  }
+  IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
+ }
+ return r;
+}
+bool XE::processDisplay13FlipTrace(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(!display13FramebufferRequested || size<0x2B620)return false;
+ const char *symbol="__ZN21AppleIntelFramebuffer22PerformFlipTransactionEP30IOAccelDisplayPipeTransaction2yP21FlipTransactionParams";
+ const uint8_t entry[17]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x48};
+ const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
+ if(fn!=address+0x2B602 || memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry)))return false;
+ if(!display13FlipTraceLock)display13FlipTraceLock=IOSimpleLockAlloc();
+ if(!display13FlipTraceLock || orgDisplay13FlipTrace)return false;
+ display13FlipDonorBase=address;display13FlipDonorSize=size;
+ display13FlipDedupe=checkKernelArgument("-wex-flip-dedupe");
+ KernelPatcher::RouteRequest route {symbol,wrapDisplay13FlipTrace,orgDisplay13FlipTrace};
+ const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+ if(ready && orgDisplay13FlipTrace)if(auto live=OSSerializer::forTarget(nullptr,display13FlipTraceSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipTrace",live);live->release();
+ }
+ if(ready && orgDisplay13FlipTrace) {
+  const char *vsym="__ZN31AppleIntelFramebufferController15hwWaitForVBlankEP21AppleIntelFramebufferj";
+  const uint8_t ventry[17]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x18};
+  const auto vfn=patcher.solveSymbol<mach_vm_address_t>(index,vsym,address,size);patcher.clearError();
+  bool vready=false;
+  if(vfn==address+0x4AE1E && !memcmp(reinterpret_cast<void *>(vfn),ventry,sizeof(ventry)) && !orgDisplay13FlipVBlank) {
+   KernelPatcher::RouteRequest vroute {vsym,wrapDisplay13FlipVBlank,orgDisplay13FlipVBlank};
+   vready=patcher.routeMultiple(index,&vroute,1,address,size) && orgDisplay13FlipVBlank;patcher.clearError();
+  }
+  if(vready)if(auto vb=OSSerializer::forTarget(nullptr,display13FlipVBlankSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipVBlank",vb);vb->release();
+  }
+  const char *bsym="__ZN31AppleIntelFramebufferController25invokeVBLInterruptHandlerEj";
+  const uint8_t bentry[20]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50,0x41,0x89,0xF5,0x49,0x89,0xFE};
+  const auto bfn=patcher.solveSymbol<mach_vm_address_t>(index,bsym,address,size);patcher.clearError();
+  bool bready=false;
+  if(bfn==address+0x73DF2 && !memcmp(reinterpret_cast<void *>(bfn),bentry,sizeof(bentry)) && !orgDisplay13FlipVBL) {
+   KernelPatcher::RouteRequest broute {bsym,wrapDisplay13FlipVBL,orgDisplay13FlipVBL};
+   bready=patcher.routeMultiple(index,&broute,1,address,size) && orgDisplay13FlipVBL;patcher.clearError();
+  }
+  if(bready)if(auto bc=OSSerializer::forTarget(nullptr,display13FlipComplSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipCompl",bc);bc->release();
+  }
+ }
+ if(ready && orgDisplay13FlipTrace)if(auto sf=OSSerializer::forTarget(nullptr,display13FlipSurfSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipSurf",sf);sf->release();
+ }
+ if(ready && orgDisplay13FlipTrace)if(auto fq=OSSerializer::forTarget(nullptr,display13FlipQueueSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipQueue",fq);fq->release();
+ }
+ if(ready && orgDisplay13FlipTrace)if(auto wm=OSSerializer::forTarget(nullptr,display13FlipWMSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipWM",wm);wm->release();
+ }
+ return ready && orgDisplay13FlipTrace;
+}
+bool XE::processDisplay13EDPBlank(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(!display13EDPBlankRequested() || !display13EDPKeep() || !display13FramebufferRequested || size<0x24E00)return false;
+ const char *symbol="__ZN21AppleIntelFramebuffer24setFramebufferPowerStateEj";
+ const uint8_t entry[20]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x41,0x89,0xF6,0x49,0x89,0xFF,0x48,0xFF,0x05,0xF1};
+ const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
+ if(fn!=address+0x24DE8 || memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry)))return false;
+ // Standard route: 16-byte prologue copied, before the RIP-relative counter.
+ KernelPatcher::RouteRequest route {symbol,wrapDisplay13EDPPowerState,orgDisplay13EDPPowerState};
+ const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+ return ready && orgDisplay13EDPPowerState;
+}
+uint32_t XE::wrapDisplay13EDPPowerState(IOService *fb,uint32_t state) {
+ namespace B=Display13EDPBlank;
+ auto s=callbackXE;auto &c=display13FBPower;auto &b=display13EDPBlankState;
+ B::Action action=B::Action::Native;bool eligible=false;uint32_t current=UINT32_MAX;
+ if(fb && c.lock && c.map && fb->getMetaClass()->getClassSize()>=0x4B90) {
+  IOLockLock(c.lock);
+  const auto base=c.map->getVirtualAddress();
+  const bool mapped=base && c.map->getLength()==0x1000000;
+  current=Display13FBMemory::field<uint32_t>(fb,0x4284);
+  eligible=mapped && display13EDPKeepKept && c.bootPanel && c.bridge.bootAdopted &&
+   Display13FBMemory::field<void *>(fb,0x1D0)==c.controller && Display13FBMemory::boundPipe(c.pipe,fb)==0;
+  action=mapped ? B::decide(eligible,current,state,b.blanked) : B::Action::Native;
+  struct IO {
+   uintptr_t base;
+   uint32_t read(uint32_t o) {return *reinterpret_cast<volatile uint32_t *>(base+o);}
+   void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
+  } io {base};
+  if(action==B::Action::Blank)B::blank(io,b);
+  else if(action==B::Action::Unblank)B::unblank(io,b);
+  if(eligible && action!=B::Action::Native)*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=state;
+  IOLockUnlock(c.lock);
+ }
+ // version, requested, previous, eligible, action, blanks, unblanks, plane, cursor
+ const uint32_t record[9]={1,state,current,eligible,static_cast<uint32_t>(action),b.blanks,b.unblanks,b.plane,b.cursor};
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlank",const_cast<uint32_t *>(record),sizeof(record));
+ if(eligible && action!=B::Action::Native)return kIOReturnSuccess;
+ // Not ours (or no longer ours after an unblank): the donor's own transition.
+ return FunctionCast(wrapDisplay13EDPPowerState,s->orgDisplay13EDPPowerState)(fb,state);
+}
+
 uint32_t XE::wrapDisplay13GMBus(IOService *controller,uint32_t bus,uint32_t speed,void *request) {
     // Extending the donor's pin bound is not permission to use an arbitrary
     // Type-C DDC bus. Only the retained controller's selected TMDS wiring
@@ -8510,6 +9385,8 @@ void XE::wrapAlderLakeNGamma10(void *path,void *transaction,uint32_t control) {
 }
 
 void XE::wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value) {
+    if(reg==0x7019C && __atomic_load_n(&display13FlipDepth,__ATOMIC_RELAXED))
+        display13FlipSurfSample(reinterpret_cast<const uint64_t *>(__builtin_frame_address(0)));
     if(display13DeferClock(access,reg,value,reinterpret_cast<uintptr_t>(__builtin_return_address(0))))return;
     // -wex-adlp-edp: the panel is driven as a fixed DP sink, so nothing may
     // power it down through PPS 0. Record donor PPS/AUX-well writes.
@@ -8821,6 +9698,14 @@ uint32_t XE::wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,b
     auto root=IORegistryEntry::getRegistryRoot();if(selected)root->setProperty("N97FBPortDDCEntry",r,sizeof(r));
     const auto result=FunctionCast(wrapAlderLakeNPortDDC,callbackXE->orgAlderLakeNPortDDC)(port,block,data,force);r[3]=result;
     if(selected)display13PanelTrace(11,block,result,config?config[0]:9,display13LinkState());
+    // -wex-edp-keep: the panel EDID's depth as the firmware runs it (8 bpc).
+    if(!result && block==1 && selected && config && config[0]<2 &&
+       (callbackXE->adlnOutputWiring.panel&(1U<<config[0])) && display13EDPKeep())Display13EDPKeep::edid8bpc(data);
+    // -wex-edp-60 (diagnostic, with -wex-edp-keep): the panel's detailed
+    // timings at half the pixel clock (2880x1800@120 -> @60, same raster).
+    static int half=-1;if(half<0)half=checkKernelArgument("-wex-edp-60") ? 1 : 0;
+    if(half==1 && !result && (block==1 || block==2) && selected && config && config[0]<2 &&
+       (callbackXE->adlnOutputWiring.panel&(1U<<config[0])) && display13EDPKeep())Display13EDPKeep::edidHalfClock(data);
     cachePanelDepth(port,block,data,result);
     if(selected) {
         if(!result && data && (block==1 || block==2)) {
@@ -8946,6 +9831,9 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
   that->setProperty("N97SharedFramebuffer",shared,sizeof(shared));
   if(auto power=OSSerializer::forTarget(that,adlnGTPowerSerialize)) {
    that->setProperty("N97GTPowerSample",power);power->release();
+  }
+  if(auto live=OSSerializer::forTarget(nullptr,adlnIRQLiveSerialize)) {
+   that->setProperty("WEXFBIRQLive",live);live->release();
   }
  }
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferStartAccepted",accepted);
@@ -9118,8 +10006,11 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                 const bool dp=ddi<7 && (callbackXE->adlnOutputWiring.links()&(1U<<ddi));
                 bool linked=!dp;
                 const bool comboBoot=ddi<2;
-                if(dp && !display13SSTPort(port,comboBoot))display13SSTPortRecord(port);
-                if(dp && display13SSTPort(port,comboBoot)) {
+                const bool sst=dp && display13SSTPort(port,comboBoot);
+                if(dp && !sst)display13SSTPortRecord(port);
+                const bool panelBoot=dp && !sst && display13PanelBootPort(port);
+                if(panelBoot)SYSLOG("igfx","Display13 eDP boot port on DDI %u admitted with native mode 0",ddi);
+                if(sst || panelBoot) {
                     Display13FBBootIO io{c.map};auto &boot=c.displayScratch;AlderLakeN::readDisplay(io,true,boot);
                     if(ddi>=3) {
                         const auto source=Display13TC::Boot::capture(io,true,ddi,0);
@@ -10186,6 +11077,7 @@ void XE::wrapAlderLakeNDisableDisplay(IOService *controller,IOService *fb,OSObje
 }
 
 void XE::adlnWMEnable(OSObject *plane,bool arm,bool cursor) {
+ display13FlipWMBump(1);
 	auto &c=display13FBPower;if(!c.lock || !plane || plane->getMetaClass()->getClassSize()<0x1C8)return;
 	auto fb=Display13FBMemory::field<IOService *>(plane,0x68);
 	if(!fb || fb->getMetaClass()->getClassSize()<0x4B90)return;
@@ -10273,12 +11165,13 @@ void XE::adlnWMEnable(OSObject *plane,bool arm,bool cursor) {
 		if(!queued)r.status=Display13WM::Status::Input;
 	}
 	IORecursiveLockUnlock(mutex);
-	if(queued && arm)reinterpret_cast<void (*)(void *)>(callbackXE->adlnWMArmUpdate)(fb);
+	if(queued && arm){display13FlipWMBump(5);reinterpret_cast<void (*)(void *)>(callbackXE->adlnWMArmUpdate)(fb);}
 	IOLockLock(c.lock);c.pipe[pipe].wmProgramming=false;c.pipe[pipe].wmProgram[cursor ? 1 : 0]=r;
 	if(r.status!=Display13WM::Status::Complete)adlnFault(c.watermarkFaulted,__LINE__);
 	IOLockUnlock(c.lock);record[2]=static_cast<uint32_t>(r.status);
 	// Trigger queued is not a VBlank/flip/DSB ACK. No DBUF retirement or
 	// watermarkClockHz qualification occurs here.
+	if(queued)display13FlipWMBump(3);
 	record[10]=queued;record[11]=queued && arm;record[12]=surface;record[13]=queueIndex;record[14]=pipe;
 	IORegistryEntry::getRegistryRoot()->setProperty(cursor ? "N97FBCursorWMProgram" : "N97FBPrimaryWMProgram",record,sizeof(record));
 	auto root=IORegistryEntry::getRegistryRoot();
@@ -10391,6 +11284,7 @@ static bool adlnObserveScanoutPixels(unsigned pipe,uint64_t (&q)[88]) {
 }
 
 void XE::wrapDisplay13WMArmUpdate(IOService *fb) {
+    display13FlipArmObserve(fb);
     if(!callbackXE->adlnOutputWiring.dsi){display13WMArmUpdate(fb);return;}
     if(!fb || fb->getMetaClass()->getClassSize()<0x4B90)return;
     {
@@ -14911,6 +15805,7 @@ uint32_t XE::wrapADLSLightUpEDP(void *controller,void *fb,void *path,const void 
 }
 uint32_t XE::wrapADLSPanelBacklight(void *controller,uint32_t brightness) {
  auto s=callbackXE;
+ {uint32_t result=0;if(display13EDPAuxBrightness(controller,brightness,result))return result;}
  if(s->display13FramebufferRequested && s->adlnOutputWiring.panel)return display13PanelBrightness(controller,brightness);
  if(!s->adlsDisplaySelected || !s->adlsWiring.panel)
   return FunctionCast(wrapADLSPanelBacklight,s->orgADLSPanelBacklight)(controller,brightness);
@@ -18652,8 +19547,10 @@ void XE::wrapTGLModeTiming(void *controller,void *fb,void *timing) {
  auto port=*reinterpret_cast<void **>(path+0x3648);
  const auto ddi=tglPanelDepthPort(port);if(ddi>1)return;
  IOSimpleLockLock(tglAUXLock);
- const auto maximum=tglPanelDepthCache[ddi].port==port ? tglPanelDepthCache[ddi].maximum : 0;
+ auto maximum=tglPanelDepthCache[ddi].port==port ? tglPanelDepthCache[ddi].maximum : 0;
  IOSimpleLockUnlock(tglAUXLock);
+ // -wex-edp-keep: the mode set requests the firmware's 8 bpc on the panel.
+ if(display13EDPKeep() && (callbackXE->adlnOutputWiring.panel&(1U<<ddi)) && (!maximum || maximum>8))maximum=8;
  const auto encoding=*reinterpret_cast<uint16_t *>(t+0x88);
  auto &depth=*reinterpret_cast<uint16_t *>(t+0x8A);
  const auto before=depth;

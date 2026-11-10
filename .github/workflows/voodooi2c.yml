@@ -1,0 +1,50 @@
+name: VoodooI2C master
+
+on:
+  push:
+    paths:
+      - .github/workflows/voodooi2c.yml
+      - tools/hidprobe/voodooi2chid-ptp-switch.patch
+  workflow_dispatch:
+
+env:
+  PROJECT_TYPE: KEXT
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      JOB_TYPE: BUILD
+    steps:
+    - name: Checkout VoodooI2C
+      uses: actions/checkout@v4
+      with:
+        repository: VoodooI2C/VoodooI2C
+        ref: 6be653a2d2234ac1f7464ebf12716314975c3920
+        submodules: recursive
+        fetch-depth: 500
+    - name: Checkout patches
+      uses: actions/checkout@v4
+      with:
+        path: wexpatches
+    - name: Apply PTP function switch patch
+      run: git -C "VoodooI2C Satellites/VoodooI2CHID" apply "$GITHUB_WORKSPACE/wexpatches/tools/hidprobe/voodooi2chid-ptp-switch.patch" && git -C "VoodooI2C Satellites/VoodooI2CHID" diff --stat
+    - name: Checkout MacKernelSDK
+      uses: actions/checkout@v4
+      with:
+        repository: acidanthera/MacKernelSDK
+        path: MacKernelSDK
+    - name: CI Bootstrap
+      run: |
+        src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/ocbuild/master/ci-bootstrap.sh) && eval "$src" || exit 1
+    - name: VoodooInput Bootstrap
+      run: |
+        src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/VoodooInput/master/VoodooInput/Scripts/bootstrap.sh) && eval "$src" && mv VoodooInput Dependencies
+    - name: Build Release
+      run: xcodebuild -workspace VoodooI2C.xcworkspace -scheme VoodooI2C -derivedDataPath build -jobs 1 -configuration Release
+    - name: Build Debug
+      run: xcodebuild -workspace VoodooI2C.xcworkspace -scheme VoodooI2C -derivedDataPath build -jobs 1 -configuration Debug
+    - uses: actions/upload-artifact@v4
+      with:
+        name: VoodooI2C-ptpswitch
+        path: build/Build/Products/*/*.zip

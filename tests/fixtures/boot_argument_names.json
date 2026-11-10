@@ -154,6 +154,18 @@
   "-wex-scanout-coherent": [],
   "-wex-adlp-load-only": [],
   "-wex-display13-offline": [],
+  "-wex-edp-keep": [],
+  "-wex-edp-dsc": [],
+  "-wex-edp-60": [],
+  "-wex-edp-dsc-retrain": [],
+  "-wex-edp-blank": [],
+  "-wex-mtl-poshfix": [],
+  "-wex-pm": [],
+  "-wex-flip-trace": [],
+  "-wex-flip-dedupe": [],
+  "-wex-edp-auxbl": [],
+  "-wex-edp-auxbl-intel": [],
+  "-wex-edp-auxbl-final": [],
   "-wex-dsi-hdmi-test": [],
   "-wex-dsi-power-test": []
 }
