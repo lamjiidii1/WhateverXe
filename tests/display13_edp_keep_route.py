@@ -36,6 +36,7 @@ extra=extra.replace(' bool processDisplay13FramebufferAUX(KernelPatcher &,size_t
 assert ' mach_vm_address_t orgDisplay13RegsNeedUpdate {};' in header and ' static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);' in header
 extra+=' uintptr_t orgDisplay13RegsNeedUpdate {};\n static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);\n'
 base=base.replace('struct XE {','struct XE {\n'+extra)
+base=base.replace('struct XE {','static int display13PanelRateIndex(void*,uint8_t,uint32_t(*)(void*,uint32_t,void*,uint32_t)){return -1;}\nstruct XE {\n bool display13PanelDP=false;static void display13AUXFailRecord(void*,uint32_t,uint32_t){}\n',1)
 code=base+(r/'tests/display13_edp_keep_route_fixture.cpp').read_text()
 if len(sys.argv)>1:
  b=Path(sys.argv[1]).read_bytes()

@@ -86,12 +86,13 @@ int main() {
     if(FILE *f=fopen(fixture.c_str(),"rb")) {
         std::vector<uint8_t> raw(65536);raw.resize(fread(raw.data(),1,raw.size(),f));fclose(f);
         auto real=parse(raw.data(),raw.size(),Family::AlderLakeP,true);
-        assert(real.valid() && real.version==247 && real.duplicates==1 && !real.panel.valid);
+        assert(real.valid() && real.version==247 && real.duplicates==1 && real.panel.valid && real.panel.type==0 && real.panel.ddi==0);
         assert(real.present==(3U|(0xFU<<3)) && real.port[0].type==0x1806 && real.port[0].aux==0x40);
         assert(real.port[1].type==0x1806); // eDP-B placeholder wins over the later HDMI-B child
         assert(display13PanelDP(real)==1);
         auto fixed=display13Fixed(real,Display13OutputWiring::Physical);
         assert(fixed.valid && !fixed.hdmi && fixed.dp==fixed.typeC); // TC children are Type-C capable, not fixed
+        fixed.panel&=~display13PanelDP(real);
         fixed.dp|=display13PanelDP(real);
         fixed.dp&=~0x78U;fixed.typeC=0;
         assert(Display13FBTopology::supportedWiring(fixed,true,false,1) && fixed.selected()==1);

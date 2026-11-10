@@ -3948,6 +3948,7 @@ Display13OutputWiring XE::display13BoardWiring(IOService *provider) {
     if(!property) {
         board=XELP::VBT::display13Fixed(firmwarePorts,Display13OutputWiring::Physical,xeProfile.family);
         if(display13PanelDP && board.valid) {
+            board.panel&=~XELP::VBT::display13PanelDP(firmwarePorts);
             board.dp|=XELP::VBT::display13PanelDP(firmwarePorts)&~board.hdmi;
             board.dp&=~0x78U;
             board.typeC=0;
