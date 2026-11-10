@@ -8291,8 +8291,8 @@ static bool display13FlipVBlankSerialize(void *,void *,OSSerialize *serializer) 
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 // WEXFlipQueue: the trigger packets armUpdate flushes during a flip, and the
-// optional -wex-flip-dedupe experiment that drops an earlier PLANE_SURF_1_A
-// packet when a later one in the same queue has the same value and flags.
+// optional -wex-flip-dedupe experiment that drops an earlier pipe A plane
+// surface packet when a later one in the same queue has the same value.
 //  [0] version [1] armUpdate calls inside a flip [2] paths flushed
 //  [3] last packet count [4] max packet count [5] SURF packets seen
 //  [6] SURF packets removed [7] dedupe enabled
@@ -8337,8 +8337,11 @@ static void display13FlipArmObserve(IOService *fb) {
   uint32_t out=0;
   for(uint32_t k=0;k<n;++k) {
    bool drop=false;
-   if(packet[3*k]==0x7019C)for(uint32_t j=k+1;j<n;++j)
-    if(packet[3*j]==0x7019C) {drop=packet[3*j+1]==packet[3*k+1] && packet[3*j+2]==packet[3*k+2];break;}
+   // Pipe A plane surface registers (PLANE_SURF_n_A). The flush writes
+   // reg/value only, so an earlier packet with the same value is redundant.
+   const auto reg=packet[3*k];
+   if((reg>>12)==0x70 && (reg&0xFFF)>=0x19C && (reg&0xFF)==0x9C)for(uint32_t j=k+1;j<n;++j)
+    if(packet[3*j]==reg) {drop=packet[3*j+1]==packet[3*k+1];break;}
    if(drop) {++q[6];continue;}
    if(out!=k)memmove(packet+3*out,packet+3*k,3*sizeof(uint32_t));
    ++out;
