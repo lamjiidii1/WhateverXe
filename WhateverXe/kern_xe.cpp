@@ -8350,6 +8350,25 @@ static void display13FlipArmObserve(IOService *fb) {
  }
  IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
 }
+// WEXFlipCompl: when does the donor mark a flip complete (fb+0x4008 back to
+// -1, what IsTransactionComplete reports), and how soon does WindowServer
+// send the next flip after that.
+//  [0] version [1] VBL handler calls [2] ...with a flip pending before
+//  [3] completions inside the VBL handler [4] completed already at flip end
+//  [5] flips started while the previous one was still pending
+//  [6..9] flip end -> VBL completion: <8.4, <16.7, <25, >=25 ms
+//  [10..14] completion -> next flip start: <1, <4, <8.4, <16.7, >=16.7 ms
+//  [15] last pending value at flip start [16] last fb+0x4004 at VBL
+static IOService *display13FlipLastFB=nullptr;
+static uint64_t display13FlipLastEnd=0,display13FlipLastComplete=0;
+static uint64_t display13FlipCompl[20] {1};
+static bool display13FlipComplSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[20];
+ if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipCompl,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
+ else memcpy(q,display13FlipCompl,sizeof(q));
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 static bool display13FlipTraceSerialize(void *,void *,OSSerialize *serializer) {
  uint64_t q[16];
  if(display13FlipTraceLock){const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);memcpy(q,display13FlipTrace,sizeof(q));IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);}
@@ -8365,9 +8384,12 @@ uint32_t XE::wrapDisplay13FlipTrace(IOService *fb,void *transaction,uint64_t arg
  uint32_t before[5] {},after[5] {};
  uint64_t t0;clock_get_uptime(&t0);absolutetime_to_nanoseconds(t0,&t0);
  if(base)for(unsigned i=0;i<5;++i)before[i]=*reinterpret_cast<volatile uint32_t *>(base+regs[i]);
+ const bool fbok=fb && fb->getMetaClass()->getClassSize()>=0x4B90;
+ const int32_t pend0=fbok ? *reinterpret_cast<volatile int32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4008) : -1;
  __atomic_add_fetch(&display13FlipDepth,1,__ATOMIC_RELAXED);
  const auto r=FunctionCast(wrapDisplay13FlipTrace,s->orgDisplay13FlipTrace)(fb,transaction,arg,params);
  __atomic_sub_fetch(&display13FlipDepth,1,__ATOMIC_RELAXED);
+ const int32_t pend1=fbok ? *reinterpret_cast<volatile int32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4008) : 0;
  if(base)for(unsigned i=0;i<5;++i)after[i]=*reinterpret_cast<volatile uint32_t *>(base+regs[i]);
  uint64_t t1;clock_get_uptime(&t1);absolutetime_to_nanoseconds(t1,&t1);
  if(display13FlipTraceLock) {
@@ -8386,6 +8408,18 @@ uint32_t XE::wrapDisplay13FlipTrace(IOService *fb,void *transaction,uint64_t arg
   }
   display13FlipTraceLast=t0;
   q[14]=r;if(t1-t0>q[15])q[15]=t1-t0;
+  if(fbok) {
+   auto &k=display13FlipCompl;
+   if(pend0!=-1)++k[5];
+   k[15]=static_cast<uint32_t>(pend0);
+   if(display13FlipLastComplete) {
+    const uint64_t d=t0-display13FlipLastComplete;
+    ++k[10+(d<1000000ULL?0:d<4000000ULL?1:d<8400000ULL?2:d<16700000ULL?3:4)];
+    display13FlipLastComplete=0;
+   }
+   if(pend1==-1) {++k[4];display13FlipLastComplete=t1;}
+   display13FlipLastEnd=t1;display13FlipLastFB=fb;
+  }
   IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
  }
  return r;
@@ -8411,6 +8445,28 @@ uint64_t XE::wrapDisplay13FlipVBlank(void *controller,void *fb,uint32_t count) {
     if(!slot[1]) {slot[0]=ra;slot[1]=1;break;}
    }
   } else ++q[9];
+  IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
+ }
+ return r;
+}
+uint64_t XE::wrapDisplay13FlipVBL(void *controller,uint32_t pipe) {
+ auto fb=__atomic_load_n(&display13FlipLastFB,__ATOMIC_RELAXED);
+ auto fbb=reinterpret_cast<uint8_t *>(fb);
+ const int32_t pre=fb ? *reinterpret_cast<volatile int32_t *>(fbb+0x4008) : -2;
+ const auto r=FunctionCast(wrapDisplay13FlipVBL,callbackXE->orgDisplay13FlipVBL)(controller,pipe);
+ const int32_t post=fb ? *reinterpret_cast<volatile int32_t *>(fbb+0x4008) : -2;
+ uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&t);
+ if(fb && display13FlipTraceLock) {
+  const auto saved=IOSimpleLockLockDisableInterrupt(display13FlipTraceLock);
+  auto &k=display13FlipCompl;
+  ++k[1];if(pre!=-1)++k[2];
+  k[16]=*reinterpret_cast<volatile uint32_t *>(fbb+0x4004);
+  if(pre!=-1 && post==-1) {
+   ++k[3];
+   const uint64_t d=display13FlipLastEnd && t>display13FlipLastEnd ? t-display13FlipLastEnd : 0;
+   ++k[6+(d<8400000ULL?0:d<16700000ULL?1:d<25000000ULL?2:3)];
+   display13FlipLastComplete=t;
+  }
   IOSimpleLockUnlockEnableInterrupt(display13FlipTraceLock,saved);
  }
  return r;
@@ -8441,6 +8497,17 @@ bool XE::processDisplay13FlipTrace(KernelPatcher &patcher,size_t index,mach_vm_a
   }
   if(vready)if(auto vb=OSSerializer::forTarget(nullptr,display13FlipVBlankSerialize)) {
    IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipVBlank",vb);vb->release();
+  }
+  const char *bsym="__ZN31AppleIntelFramebufferController25invokeVBLInterruptHandlerEj";
+  const uint8_t bentry[20]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50,0x41,0x89,0xF5,0x49,0x89,0xFE};
+  const auto bfn=patcher.solveSymbol<mach_vm_address_t>(index,bsym,address,size);patcher.clearError();
+  bool bready=false;
+  if(bfn==address+0x73DF2 && !memcmp(reinterpret_cast<void *>(bfn),bentry,sizeof(bentry)) && !orgDisplay13FlipVBL) {
+   KernelPatcher::RouteRequest broute {bsym,wrapDisplay13FlipVBL,orgDisplay13FlipVBL};
+   bready=patcher.routeMultiple(index,&broute,1,address,size) && orgDisplay13FlipVBL;patcher.clearError();
+  }
+  if(bready)if(auto bc=OSSerializer::forTarget(nullptr,display13FlipComplSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXFlipCompl",bc);bc->release();
   }
  }
  if(ready && orgDisplay13FlipTrace)if(auto sf=OSSerializer::forTarget(nullptr,display13FlipSurfSerialize)) {
